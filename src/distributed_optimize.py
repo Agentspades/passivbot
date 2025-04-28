@@ -186,6 +186,10 @@ class OptimizationServer(DistributedOptimizer):
 
     async def handle_client_message(self, client_id, message):
         """Process messages from clients"""
+        # Decode client_id if it's bytes
+        if isinstance(client_id, bytes):
+            client_id = client_id.decode("utf-8")
+
         msg_type = message.get("type")
 
         if msg_type == "register":
@@ -200,7 +204,7 @@ class OptimizationServer(DistributedOptimizer):
             logging.info(f"New client registered: {hostname} ({client_id})")
             await self.router_socket.send_multipart(
                 [
-                    client_id,
+                    client_id.encode() if isinstance(client_id, str) else client_id,
                     json.dumps({"type": "registered", "config": self.config}).encode(),
                 ]
             )
@@ -210,7 +214,10 @@ class OptimizationServer(DistributedOptimizer):
             if client_id in self.clients:
                 self.clients[client_id]["last_seen"] = time.time()
                 await self.router_socket.send_multipart(
-                    [client_id, json.dumps({"type": "ack"}).encode()]
+                    [
+                        client_id.encode() if isinstance(client_id, str) else client_id,
+                        json.dumps({"type": "ack"}).encode(),
+                    ]
                 )
 
         elif msg_type == "ready":
@@ -268,6 +275,10 @@ class OptimizationServer(DistributedOptimizer):
             # No more tasks to send
             return
 
+        # Ensure client_id is properly decoded
+        if isinstance(client_id, bytes):
+            client_id = client_id.decode("utf-8")
+
         # Get batch of individuals to evaluate
         batch_size = min(self.batch_size, len(self.population))
         individuals = self.population[:batch_size]
@@ -286,7 +297,10 @@ class OptimizationServer(DistributedOptimizer):
         }
 
         await self.router_socket.send_multipart(
-            [client_id, json.dumps(task_message).encode()]
+            [
+                client_id.encode() if isinstance(client_id, str) else client_id,
+                json.dumps(task_message).encode(),
+            ]
         )
 
         # Update client status
