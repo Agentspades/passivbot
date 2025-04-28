@@ -11,8 +11,10 @@ import uuid
 import zmq
 import zmq.asyncio
 import numpy as np
+import psutil
 from copy import deepcopy
 from typing import Dict, List, Tuple, Optional, Any
+from multiprocessing import cpu_count
 
 # Import from passivbot
 from optimize import (
@@ -48,6 +50,56 @@ logging.basicConfig(
     level=logging.INFO,
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
+
+
+class ResourceManager:
+    """Manages CPU and memory resources for optimization"""
+
+    def __init__(self, max_cpu_percent=70, max_memory_percent=80, check_interval=5):
+        self.max_cpu_percent = max_cpu_percent
+        self.max_memory_percent = max_memory_percent
+        self.check_interval = check_interval
+        self.paused = False
+        self.last_check = 0
+
+    def should_pause(self):
+        """Check if processing should be paused due to high resource usage"""
+        # Only check periodically to avoid overhead
+        current_time = time.time()
+        if current_time - self.last_check < self.check_interval:
+            return self.paused
+
+        self.last_check = current_time
+
+        # Check CPU usage
+        cpu_percent = psutil.cpu_percent(interval=0.5)
+
+        # Check memory usage
+        memory_percent = psutil.virtual_memory().percent
+
+        # Determine if we should pause
+        if (
+            cpu_percent > self.max_cpu_percent
+            or memory_percent > self.max_memory_percent
+        ):
+            if not self.paused:
+                logging.info(
+                    f"Pausing due to high resource usage: CPU {cpu_percent}%, Memory {memory_percent}%"
+                )
+                self.paused = True
+        else:
+            if self.paused:
+                logging.info(
+                    f"Resuming processing: CPU {cpu_percent}%, Memory {memory_percent}%"
+                )
+                self.paused = False
+
+        return self.paused
+
+    async def wait_for_resources(self):
+        """Wait until resource usage is below thresholds"""
+        while self.should_pause():
+            await asyncio.sleep(self.check_interval)
 
 
 class DistributedOptimizer:
@@ -195,8 +247,10 @@ class OptimizationServer(DistributedOptimizer):
         if msg_type == "register":
             # New client registration
             hostname = message.get("hostname", "unknown")
+            resource_info = message.get("resources", {})
             self.clients[client_id] = {
                 "hostname": hostname,
+                "resources": resource_info,
                 "last_seen": time.time(),
                 "status": "idle",
                 "tasks_completed": 0,
@@ -213,6 +267,9 @@ class OptimizationServer(DistributedOptimizer):
             # Update client's last seen timestamp
             if client_id in self.clients:
                 self.clients[client_id]["last_seen"] = time.time()
+                # Update resource info if provided
+                if "resources" in message:
+                    self.clients[client_id]["resources"] = message["resources"]
                 await self.router_socket.send_multipart(
                     [
                         client_id.encode() if isinstance(client_id, str) else client_id,
@@ -312,9 +369,14 @@ class OptimizationServer(DistributedOptimizer):
     async def process_results(self, results):
         """Process optimization results from clients"""
         for result in results:
-            individual = result["individual"]
-            config = result["config"]
-            analyses_combined = result["analyses_combined"]
+            individual = result.get("individual")
+            config = result.get("config")
+            analyses_combined = result.get("analyses_combined")
+
+            # Skip invalid results
+            if not individual or not config or not analyses_combined:
+                logging.warning(f"Skipping invalid result: missing required fields")
+                continue
 
             # Extract scores
             if self.scoring_keys is None and "optimize" in config:
@@ -431,8 +493,8 @@ class OptimizationServer(DistributedOptimizer):
         disconnected_clients = []
 
         for client_id, client_info in self.clients.items():
-            # Check if client hasn't sent a heartbeat in 60 seconds
-            if current_time - client_info["last_seen"] > 60:
+            # Check if client hasn't sent a heartbeat in 120 seconds (increased from 60)
+            if current_time - client_info["last_seen"] > 120:
                 logging.warning(
                     f"Client {client_id} ({client_info['hostname']}) appears to be disconnected"
                 )
@@ -664,6 +726,15 @@ class OptimizationClient(DistributedOptimizer):
         self.server_address = args.server
         self.hostname = socket.gethostname()
 
+        # Resource management
+        self.max_cpu_percent = args.max_cpu
+        self.max_memory_percent = args.max_memory
+        self.resource_manager = ResourceManager(
+            max_cpu_percent=self.max_cpu_percent,
+            max_memory_percent=self.max_memory_percent,
+        )
+        self.n_workers = args.workers if args.workers > 0 else max(1, cpu_count() - 1)
+
         # ZMQ sockets
         self.dealer_socket = self.context.socket(zmq.DEALER)
         self.sub_socket = self.context.socket(zmq.SUB)
@@ -688,8 +759,22 @@ class OptimizationClient(DistributedOptimizer):
         self.sub_socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all messages
 
         # Register with server
+        resource_info = {
+            "cpu_count": cpu_count(),
+            "workers": self.n_workers,
+            "max_cpu_percent": self.max_cpu_percent,
+            "max_memory_percent": self.max_memory_percent,
+            "total_memory": psutil.virtual_memory().total,
+        }
+
         await self.dealer_socket.send(
-            json.dumps({"type": "register", "hostname": self.hostname}).encode()
+            json.dumps(
+                {
+                    "type": "register",
+                    "hostname": self.hostname,
+                    "resources": resource_info,
+                }
+            ).encode()
         )
 
         # Wait for registration confirmation
@@ -832,25 +917,22 @@ class OptimizationClient(DistributedOptimizer):
         logging.info(f"Processing task {task_id} with {len(individuals)} individuals")
 
         results = []
+
+        # Create a worker pool based on configured number of workers
+        worker_semaphore = asyncio.Semaphore(self.n_workers)
+
+        # Process individuals with resource management
+        tasks = []
         for individual in individuals:
-            try:
-                # Evaluate individual
-                objectives = self.evaluator.evaluate(individual, overrides_list)
+            # Create a task for each individual
+            tasks.append(
+                self.process_individual(individual, overrides_list, worker_semaphore)
+            )
 
-                # Get result from queue
-                result = await self.results_queue.get()
-
-                # Add individual to result for tracking
-                result["individual"] = individual
-
-                # Add to results list
+        # Wait for all individuals to be processed
+        for result in await asyncio.gather(*tasks):
+            if result:
                 results.append(result)
-
-            except Exception as e:
-                logging.error(f"Error evaluating individual: {e}")
-                import traceback
-
-                traceback.print_exc()
 
         # Send results back to server
         await self.dealer_socket.send(
@@ -864,17 +946,66 @@ class OptimizationClient(DistributedOptimizer):
 
         logging.info(f"Completed task {task_id}")
 
+    async def process_individual(self, individual, overrides_list, worker_semaphore):
+        """Process a single individual with resource management"""
+        try:
+            # Check if we should pause due to high resource usage
+            await self.resource_manager.wait_for_resources()
+
+            # Acquire worker semaphore to limit concurrent evaluations
+            async with worker_semaphore:
+                # Evaluate individual
+                objectives = self.evaluator.evaluate(individual, overrides_list)
+
+                # Get result from queue
+                result = await self.results_queue.get()
+
+                # Add individual to result for tracking
+                result["individual"] = individual
+
+                # Ensure config is present in the result
+                if "config" not in result:
+                    # Create config from individual
+                    result["config"] = individual_to_config(
+                        individual,
+                        optimizer_overrides,
+                        overrides_list,
+                        template=self.config,
+                    )
+
+                return result
+
+        except Exception as e:
+            logging.error(f"Error evaluating individual: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return None
+
     async def heartbeat_loop(self):
         """Send periodic heartbeats to server"""
         while True:
             try:
+                # Get current resource usage
+                cpu_percent = psutil.cpu_percent(interval=0.5)
+                memory_percent = psutil.virtual_memory().percent
+
+                resource_info = {
+                    "cpu_percent": cpu_percent,
+                    "memory_percent": memory_percent,
+                    "workers": self.n_workers,
+                    "paused": self.resource_manager.paused,
+                }
+
                 await self.dealer_socket.send(
-                    json.dumps({"type": "heartbeat"}).encode()
+                    json.dumps(
+                        {"type": "heartbeat", "resources": resource_info}
+                    ).encode()
                 )
             except Exception as e:
                 logging.error(f"Error sending heartbeat: {e}")
 
-            await asyncio.sleep(30)  # Send heartbeat every 30 seconds
+            await asyncio.sleep(15)  # Send heartbeat every 15 seconds instead of 30
 
     async def status_listener(self):
         """Listen for status broadcasts from server"""
@@ -996,6 +1127,24 @@ async def main():
         "--server",
         type=str,
         help="Server address in format host:port (client mode only)",
+    )
+    parser.add_argument(
+        "--max-cpu",
+        type=int,
+        default=70,
+        help="Maximum CPU usage percentage (client mode only)",
+    )
+    parser.add_argument(
+        "--max-memory",
+        type=int,
+        default=80,
+        help="Maximum memory usage percentage (client mode only)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Number of worker processes (0 = auto, client mode only)",
     )
 
     args = parser.parse_args()

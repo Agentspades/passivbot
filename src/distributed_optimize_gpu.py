@@ -11,8 +11,10 @@ import uuid
 import zmq
 import zmq.asyncio
 import numpy as np
+import psutil
 from copy import deepcopy
 from typing import Dict, List, Tuple, Optional, Any
+from multiprocessing import cpu_count
 
 # Import from passivbot
 from optimize import (
@@ -62,6 +64,97 @@ try:
         logging.warning("CUDA libraries found but no GPU detected")
 except ImportError:
     logging.warning("GPU acceleration libraries not found, running in CPU-only mode")
+
+
+class ResourceManager:
+    """Manages CPU and memory resources for optimization"""
+
+    def __init__(self, max_cpu_percent=70, max_memory_percent=80, check_interval=5):
+        self.max_cpu_percent = max_cpu_percent
+        self.max_memory_percent = max_memory_percent
+        self.check_interval = check_interval
+        self.paused = False
+        self.last_check = 0
+
+    def should_pause(self):
+        """Check if processing should be paused due to high resource usage"""
+        # Only check periodically to avoid overhead
+        current_time = time.time()
+        if current_time - self.last_check < self.check_interval:
+            return self.paused
+
+        self.last_check = current_time
+
+        # Check CPU usage
+        cpu_percent = psutil.cpu_percent(interval=0.5)
+
+        # Check memory usage
+        memory_percent = psutil.virtual_memory().percent
+
+        # Determine if we should pause
+        if (
+            cpu_percent > self.max_cpu_percent
+            or memory_percent > self.max_memory_percent
+        ):
+            if not self.paused:
+                logging.info(
+                    f"Pausing due to high resource usage: CPU {cpu_percent}%, Memory {memory_percent}%"
+                )
+                self.paused = True
+        else:
+            if self.paused:
+                logging.info(
+                    f"Resuming processing: CPU {cpu_percent}%, Memory {memory_percent}%"
+                )
+                self.paused = False
+
+        return self.paused
+
+    async def wait_for_resources(self):
+        """Wait until resource usage is below thresholds"""
+        while self.should_pause():
+            await asyncio.sleep(self.check_interval)
+
+
+class GPUResourceManager(ResourceManager):
+    """Manages GPU resources for optimization"""
+
+    def __init__(
+        self,
+        max_cpu_percent=70,
+        max_memory_percent=80,
+        max_gpu_percent=80,
+        check_interval=5,
+    ):
+        super().__init__(max_cpu_percent, max_memory_percent, check_interval)
+        self.max_gpu_percent = max_gpu_percent
+
+    def should_pause(self):
+        """Check if processing should be paused due to high resource usage"""
+        # First check CPU and memory
+        cpu_memory_pause = super().should_pause()
+        if cpu_memory_pause:
+            return True
+
+        # Then check GPU if available
+        if GPU_AVAILABLE:
+            try:
+                # Get GPU memory usage
+                gpu_memory_used = cp.cuda.runtime.memGetInfo()[0]
+                gpu_memory_total = cp.cuda.runtime.memGetInfo()[1]
+                gpu_percent = (gpu_memory_used / gpu_memory_total) * 100
+
+                if gpu_percent > self.max_gpu_percent:
+                    if not self.paused:
+                        logging.info(
+                            f"Pausing due to high GPU usage: {gpu_percent:.1f}%"
+                        )
+                        self.paused = True
+                    return True
+            except Exception as e:
+                logging.warning(f"Error checking GPU usage: {e}")
+
+        return self.paused
 
 
 class GPUBacktester:
@@ -319,9 +412,12 @@ class OptimizationServer(DistributedOptimizer):
             # New client registration
             hostname = message.get("hostname", "unknown")
             has_gpu = message.get("has_gpu", False)
+            resource_info = message.get("resources", {})
+
             self.clients[client_id] = {
                 "hostname": hostname,
                 "has_gpu": has_gpu,
+                "resources": resource_info,
                 "last_seen": time.time(),
                 "status": "idle",
                 "tasks_completed": 0,
@@ -340,6 +436,9 @@ class OptimizationServer(DistributedOptimizer):
             # Update client's last seen timestamp
             if client_id in self.clients:
                 self.clients[client_id]["last_seen"] = time.time()
+                # Update resource info if provided
+                if "resources" in message:
+                    self.clients[client_id]["resources"] = message["resources"]
                 await self.router_socket.send_multipart(
                     [
                         client_id.encode() if isinstance(client_id, str) else client_id,
@@ -791,6 +890,25 @@ class OptimizationClient(DistributedOptimizer):
         self.server_address = args.server
         self.hostname = socket.gethostname()
 
+        # Resource management
+        self.max_cpu_percent = args.max_cpu
+        self.max_memory_percent = args.max_memory
+        self.max_gpu_percent = args.max_gpu if self.use_gpu else 0
+        self.n_workers = args.workers if args.workers > 0 else max(1, cpu_count() - 1)
+
+        # Initialize resource manager
+        if self.use_gpu:
+            self.resource_manager = GPUResourceManager(
+                max_cpu_percent=self.max_cpu_percent,
+                max_memory_percent=self.max_memory_percent,
+                max_gpu_percent=self.max_gpu_percent,
+            )
+        else:
+            self.resource_manager = ResourceManager(
+                max_cpu_percent=self.max_cpu_percent,
+                max_memory_percent=self.max_memory_percent,
+            )
+
         # ZMQ sockets
         self.dealer_socket = self.context.socket(zmq.DEALER)
         self.sub_socket = self.context.socket(zmq.SUB)
@@ -815,10 +933,35 @@ class OptimizationClient(DistributedOptimizer):
         self.sub_socket.connect(f"tcp://{server_host}:{int(server_port)+1}")
         self.sub_socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all messages
 
+        # Prepare resource info
+        resource_info = {
+            "cpu_count": cpu_count(),
+            "workers": self.n_workers,
+            "max_cpu_percent": self.max_cpu_percent,
+            "max_memory_percent": self.max_memory_percent,
+            "total_memory": psutil.virtual_memory().total,
+        }
+
+        if self.use_gpu:
+            try:
+                gpu_info = {
+                    "gpu_name": cp.cuda.runtime.getDeviceProperties(0)["name"].decode(),
+                    "gpu_memory": cp.cuda.runtime.memGetInfo()[1],
+                    "max_gpu_percent": self.max_gpu_percent,
+                }
+                resource_info.update(gpu_info)
+            except Exception as e:
+                logging.warning(f"Could not get GPU info: {e}")
+
         # Register with server
         await self.dealer_socket.send(
             json.dumps(
-                {"type": "register", "hostname": self.hostname, "has_gpu": self.use_gpu}
+                {
+                    "type": "register",
+                    "hostname": self.hostname,
+                    "has_gpu": self.use_gpu,
+                    "resources": resource_info,
+                }
             ).encode()
         )
 
@@ -974,9 +1117,15 @@ class OptimizationClient(DistributedOptimizer):
 
         results = []
 
+        # Create a worker pool based on configured number of workers
+        worker_semaphore = asyncio.Semaphore(self.n_workers)
+
         # Use GPU backtester if available
         if self.use_gpu and self.gpu_backtester:
             try:
+                # Check resource usage before GPU processing
+                await self.resource_manager.wait_for_resources()
+
                 # Process batch on GPU
                 batch_results = self.gpu_backtester.evaluate_batch(
                     individuals, overrides_list
@@ -996,46 +1145,32 @@ class OptimizationClient(DistributedOptimizer):
                 traceback.print_exc()
 
                 # Fall back to CPU evaluation
+                tasks = []
                 for individual in individuals:
-                    try:
-                        # Evaluate individual
-                        objectives = self.evaluator.evaluate(individual, overrides_list)
+                    tasks.append(
+                        self.process_individual(
+                            individual, overrides_list, worker_semaphore
+                        )
+                    )
 
-                        # Get result from queue
-                        result = await self.results_queue.get()
-
-                        # Add individual to result for tracking
-                        result["individual"] = individual
-
-                        # Add to results list
+                # Wait for all individuals to be processed
+                for result in await asyncio.gather(*tasks):
+                    if result:
                         results.append(result)
-
-                    except Exception as e:
-                        logging.error(f"Error evaluating individual: {e}")
-                        import traceback
-
-                        traceback.print_exc()
         else:
-            # CPU-only evaluation
+            # CPU-only evaluation with resource management
+            tasks = []
             for individual in individuals:
-                try:
-                    # Evaluate individual
-                    objectives = self.evaluator.evaluate(individual, overrides_list)
+                tasks.append(
+                    self.process_individual(
+                        individual, overrides_list, worker_semaphore
+                    )
+                )
 
-                    # Get result from queue
-                    result = await self.results_queue.get()
-
-                    # Add individual to result for tracking
-                    result["individual"] = individual
-
-                    # Add to results list
+            # Wait for all individuals to be processed
+            for result in await asyncio.gather(*tasks):
+                if result:
                     results.append(result)
-
-                except Exception as e:
-                    logging.error(f"Error evaluating individual: {e}")
-                    import traceback
-
-                    traceback.print_exc()
 
         # Send results back to server
         await self.dealer_socket.send(
@@ -1049,12 +1184,61 @@ class OptimizationClient(DistributedOptimizer):
 
         logging.info(f"Completed task {task_id}")
 
+    async def process_individual(self, individual, overrides_list, worker_semaphore):
+        """Process a single individual with resource management"""
+        try:
+            # Check if we should pause due to high resource usage
+            await self.resource_manager.wait_for_resources()
+
+            # Acquire worker semaphore to limit concurrent evaluations
+            async with worker_semaphore:
+                # Evaluate individual
+                objectives = self.evaluator.evaluate(individual, overrides_list)
+
+                # Get result from queue
+                result = await self.results_queue.get()
+
+                # Add individual to result for tracking
+                result["individual"] = individual
+
+                return result
+
+        except Exception as e:
+            logging.error(f"Error evaluating individual: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return None
+
     async def heartbeat_loop(self):
         """Send periodic heartbeats to server"""
         while True:
             try:
+                # Get current resource usage
+                cpu_percent = psutil.cpu_percent(interval=0.5)
+                memory_percent = psutil.virtual_memory().percent
+
+                resource_info = {
+                    "cpu_percent": cpu_percent,
+                    "memory_percent": memory_percent,
+                    "workers": self.n_workers,
+                    "paused": self.resource_manager.paused,
+                }
+
+                # Add GPU info if available
+                if self.use_gpu:
+                    try:
+                        gpu_memory_used = cp.cuda.runtime.memGetInfo()[0]
+                        gpu_memory_total = cp.cuda.runtime.memGetInfo()[1]
+                        gpu_percent = (gpu_memory_used / gpu_memory_total) * 100
+                        resource_info["gpu_percent"] = gpu_percent
+                    except Exception as e:
+                        logging.warning(f"Error getting GPU info: {e}")
+
                 await self.dealer_socket.send(
-                    json.dumps({"type": "heartbeat"}).encode()
+                    json.dumps(
+                        {"type": "heartbeat", "resources": resource_info}
+                    ).encode()
                 )
             except Exception as e:
                 logging.error(f"Error sending heartbeat: {e}")
@@ -1330,6 +1514,30 @@ async def main():
         "--server",
         type=str,
         help="Server address in format host:port (client mode only)",
+    )
+    parser.add_argument(
+        "--max-cpu",
+        type=int,
+        default=70,
+        help="Maximum CPU usage percentage (client mode only)",
+    )
+    parser.add_argument(
+        "--max-memory",
+        type=int,
+        default=80,
+        help="Maximum memory usage percentage (client mode only)",
+    )
+    parser.add_argument(
+        "--max-gpu",
+        type=int,
+        default=80,
+        help="Maximum GPU memory usage percentage (client mode only)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Number of worker processes (0 = auto, client mode only)",
     )
 
     # GPU-specific arguments

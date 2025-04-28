@@ -49,7 +49,12 @@ import math
 import fcntl
 from tqdm import tqdm
 from optimizer_overrides import optimizer_overrides
-from opt_utils import make_json_serializable, dominates, generate_incremental_diff, round_floats
+from opt_utils import (
+    make_json_serializable,
+    dominates,
+    generate_incremental_diff,
+    round_floats,
+)
 from pareto_store import ParetoStore
 import msgpack
 
@@ -115,27 +120,37 @@ def results_writer_process(queue, results_dir, compress=True):
                         continue
                     keys = [k for k in data["analyses_combined"] if k.startswith("w_")]
                     scores = [data["analyses_combined"].get(k) for k in sorted(keys)]
-                    if any(s is None or not isinstance(s, (float, int)) for s in scores):
+                    if any(
+                        s is None or not isinstance(s, (float, int)) for s in scores
+                    ):
                         continue
                     scores = tuple(float(s) for s in scores)
                     iteration += 1
                     index = iteration
                     objectives_dict[index] = scores
                     index_to_entry[index] = data
-                    if any(dominates(objectives_dict[idx], scores) for idx in pareto_front):
+                    if any(
+                        dominates(objectives_dict[idx], scores) for idx in pareto_front
+                    ):
                         continue
                     # Remove dominated entries
                     dominated = [
-                        idx for idx in pareto_front if dominates(scores, objectives_dict[idx])
+                        idx
+                        for idx in pareto_front
+                        if dominates(scores, objectives_dict[idx])
                     ]
                     for idx in dominated:
                         old_entry = index_to_entry[idx]
                         store.remove_entry(
-                            store.hash_entry(round_floats(old_entry, sig_digits=store.sig_digits))
+                            store.hash_entry(
+                                round_floats(old_entry, sig_digits=store.sig_digits)
+                            )
                         )
 
                     pareto_front = [
-                        idx for idx in pareto_front if not dominates(scores, objectives_dict[idx])
+                        idx
+                        for idx in pareto_front
+                        if not dominates(scores, objectives_dict[idx])
                     ]
                     pareto_front.append(index)
                     store.add_entry(data)
@@ -151,10 +166,12 @@ def results_writer_process(queue, results_dir, compress=True):
                     line = "(min,max): "
                     for i, sk in enumerate(scoring_keys):
                         line += f"{sk}: ({pbr.round_dynamic(min(objectives_dict[idx][i] for idx in pareto_front), 3)}"
-                        line += f",{pbr.round_dynamic(max(objectives_dict[idx][i] for idx in pareto_front), 3)})"
+                        line += f",{pbr.round_dynamic(max(objectives_dict[idx][i] for idx in pareto_front), 3)}"
                         if i < n_objectives - 1:
                             line += " | "
-                    logging.info(f"Upd PF | Iter: {iteration} | n memb: {len(pareto_front)} | {line}")
+                    logging.info(
+                        f"Upd PF | Iter: {iteration} | n memb: {len(pareto_front)} | {line}"
+                    )
                 except Exception as e:
                     logging.error(f"Error writing results: {e}")
 
@@ -175,7 +192,10 @@ def create_shared_memory_file(hlcvs):
 
         with open(shared_memory_file, "wb") as f:
             with tqdm(
-                total=total_size, unit="B", unit_scale=True, desc="Writing to shared memory"
+                total=total_size,
+                unit="B",
+                unit_scale=True,
+                desc="Writing to shared memory",
             ) as pbar:
                 for i in range(0, len(hlcvs_bytes), chunk_size):
                     chunk = hlcvs_bytes[i : i + chunk_size]
@@ -280,7 +300,9 @@ def cxSimulatedBinaryBoundedWrapper(ind1, ind2, eta, low, up):
     return ind1, ind2
 
 
-def individual_to_config(individual, optimizer_overrides, overrides_list, template=None):
+def individual_to_config(
+    individual, optimizer_overrides, overrides_list, template=None
+):
     if template is None:
         template = get_template_live_config("v7")
     keys_ignored = ["enforce_exposure_limit"]
@@ -323,7 +345,9 @@ def config_to_individual(config, param_bounds):
         ]
     # adjust to bounds
     bounds = [(low, high) for low, high in param_bounds.values()]
-    adjusted = [max(min(x, bounds[z][1]), bounds[z][0]) for z, x in enumerate(individual)]
+    adjusted = [
+        max(min(x, bounds[z][1]), bounds[z][0]) for z, x in enumerate(individual)
+    ]
     return adjusted
 
 
@@ -409,8 +433,8 @@ class Evaluator:
                 self.hlcvs_shapes[exchange],
             )
             self.shared_hlcvs_np[exchange] = self.mmap_contexts[exchange].__enter__()
-            _, self.exchange_params[exchange], self.backtest_params[exchange] = prep_backtest_args(
-                config, self.msss[exchange], exchange
+            _, self.exchange_params[exchange], self.backtest_params[exchange] = (
+                prep_backtest_args(config, self.msss[exchange], exchange)
             )
             logging.info(f"mmap_context entered successfully for {exchange}.")
 
@@ -422,7 +446,9 @@ class Evaluator:
         self.param_bounds_expanded = [
             (v[0], v[-1]) for v in list(self.config["optimize"]["bounds"].values())
         ]
-        self.sig_digits = config.get("optimize", {}).get("round_to_n_significant_digits", 6)
+        self.sig_digits = config.get("optimize", {}).get(
+            "round_to_n_significant_digits", 6
+        )
         self.scoring_weights = {
             "adg": -1.0,
             "adg_w": -1.0,
@@ -538,7 +564,9 @@ class Evaluator:
                 delta = (high - low) * 0.01
                 step = delta * np.random.uniform(-1.0, 1.0)
                 val = individual[i] + step
-                perturbed[i] = pbr.round_dynamic(np.clip(val, low, high), self.sig_digits)
+                perturbed[i] = pbr.round_dynamic(
+                    np.clip(val, low, high), self.sig_digits
+                )
         return perturbed
 
     def perturb_sample_some(self, individual, frac=0.2):
@@ -548,7 +576,9 @@ class Evaluator:
         for i in indices:
             low, high = self.param_bounds_expanded[i]
             if low != high:
-                perturbed[i] = pbr.round_dynamic(np.random.uniform(low, high), self.sig_digits)
+                perturbed[i] = pbr.round_dynamic(
+                    np.random.uniform(low, high), self.sig_digits
+                )
         return perturbed
 
     def perturb_gaussian(self, individual, scale=0.01):
@@ -571,7 +601,9 @@ class Evaluator:
             if low == high:
                 perturbed.append(low)
             else:
-                perturbed.append(pbr.round_dynamic(np.random.uniform(low, high), self.sig_digits))
+                perturbed.append(
+                    pbr.round_dynamic(np.random.uniform(low, high), self.sig_digits)
+                )
         return perturbed
 
     def evaluate(self, individual, overrides_list):
@@ -605,7 +637,10 @@ class Evaluator:
                     individual[:] = perturbed
                     self.seen_hashes[new_hash] = None
                     config = individual_to_config(
-                        perturbed, optimizer_overrides, overrides_list, template=self.config
+                        perturbed,
+                        optimizer_overrides,
+                        overrides_list,
+                        template=self.config,
                     )
                     break
             else:
@@ -623,17 +658,21 @@ class Evaluator:
                 exchange_params=self.exchange_params[exchange],
                 backtest_params=self.backtest_params[exchange],
             )
-            fills, equities_usd, equities_btc, analysis_usd, analysis_btc = pbr.run_backtest(
-                self.shared_memory_files[exchange],
-                self.hlcvs_shapes[exchange],
-                self.hlcvs_dtypes[exchange].str,
-                self.btc_usd_shared_memory_files[exchange],
-                self.btc_usd_dtypes[exchange].str,
-                bot_params,
-                self.exchange_params[exchange],
-                self.backtest_params[exchange],
+            fills, equities_usd, equities_btc, analysis_usd, analysis_btc = (
+                pbr.run_backtest(
+                    self.shared_memory_files[exchange],
+                    self.hlcvs_shapes[exchange],
+                    self.hlcvs_dtypes[exchange].str,
+                    self.btc_usd_shared_memory_files[exchange],
+                    self.btc_usd_dtypes[exchange].str,
+                    bot_params,
+                    self.exchange_params[exchange],
+                    self.backtest_params[exchange],
+                )
             )
-            analyses[exchange] = expand_analysis(analysis_usd, analysis_btc, fills, config)
+            analyses[exchange] = expand_analysis(
+                analysis_usd, analysis_btc, fills, config
+            )
         analyses_combined = self.combine_analyses(analyses)
         objectives = self.calc_fitness(analyses_combined)
         for i, val in enumerate(objectives):
@@ -643,7 +682,11 @@ class Evaluator:
             "analyses_combined": analyses_combined,
             "analyses": analyses,
         }
-        self.results_queue.put(data)
+
+        # Fix: Use put_nowait instead of put for synchronous operation
+        # This avoids the "coroutine was never awaited" warning
+        self.results_queue.put_nowait(data)
+
         actual_hash = calc_hash(individual)
         self.seen_hashes[actual_hash] = tuple(objectives)
         return tuple(objectives)
@@ -653,7 +696,11 @@ class Evaluator:
         keys = analyses[next(iter(analyses))].keys()
         for key in keys:
             values = [analysis[key] for analysis in analyses.values()]
-            if not values or any([x == np.inf for x in values]) or any([x is None for x in values]):
+            if (
+                not values
+                or any([x == np.inf for x in values])
+                or any([x is None for x in values])
+            ):
                 analyses_combined[f"{key}_mean"] = 0.0
                 analyses_combined[f"{key}_min"] = 0.0
                 analyses_combined[f"{key}_max"] = 0.0
@@ -827,7 +874,11 @@ async def main():
     manage_rust_compilation()
     parser = argparse.ArgumentParser(prog="optimize", description="run optimizer")
     parser.add_argument(
-        "config_path", type=str, default=None, nargs="?", help="path to json passivbot config"
+        "config_path",
+        type=str,
+        default=None,
+        nargs="?",
+        help="path to json passivbot config",
     )
     template_config = get_template_live_config("v7")
     del template_config["bot"]
@@ -875,8 +926,8 @@ async def main():
         config["backtest"]["coins"] = {}
         if config["backtest"]["combine_ohlcvs"]:
             exchange = "combined"
-            coins, hlcvs, mss, results_path, cache_dir, btc_usd_prices = await prepare_hlcvs_mss(
-                config, exchange
+            coins, hlcvs, mss, results_path, cache_dir, btc_usd_prices = (
+                await prepare_hlcvs_mss(config, exchange)
             )
             exchange_preference = defaultdict(list)
             for coin in coins:
@@ -905,13 +956,19 @@ async def main():
                 btc_usd_data_dict[exchange]
             )
             btc_usd_dtypes[exchange] = btc_usd_data_dict[exchange].dtype
-            logging.info(f"Finished creating shared memory file for {exchange}: {shared_memory_file}")
+            logging.info(
+                f"Finished creating shared memory file for {exchange}: {shared_memory_file}"
+            )
         else:
             tasks = {}
             for exchange in config["backtest"]["exchanges"]:
-                tasks[exchange] = asyncio.create_task(prepare_hlcvs_mss(config, exchange))
+                tasks[exchange] = asyncio.create_task(
+                    prepare_hlcvs_mss(config, exchange)
+                )
             for exchange in config["backtest"]["exchanges"]:
-                coins, hlcvs, mss, results_path, cache_dir, btc_usd_prices = await tasks[exchange]
+                coins, hlcvs, mss, results_path, cache_dir, btc_usd_prices = (
+                    await tasks[exchange]
+                )
                 config["backtest"]["coins"][exchange] = coins
                 hlcvs_dict[exchange] = hlcvs
                 hlcvs_shapes[exchange] = hlcvs.shape
@@ -927,9 +984,13 @@ async def main():
                 if config["backtest"].get("use_btc_collateral", False):
                     btc_usd_data_dict[exchange] = btc_usd_prices
                 else:
-                    btc_usd_data_dict[exchange] = np.ones(hlcvs.shape[0], dtype=np.float64)
+                    btc_usd_data_dict[exchange] = np.ones(
+                        hlcvs.shape[0], dtype=np.float64
+                    )
 
-                validate_array(btc_usd_data_dict[exchange], f"btc_usd_data for {exchange}")
+                validate_array(
+                    btc_usd_data_dict[exchange], f"btc_usd_data for {exchange}"
+                )
                 btc_usd_shared_memory_files[exchange] = create_shared_memory_file(
                     btc_usd_data_dict[exchange]
                 )
@@ -938,9 +999,13 @@ async def main():
                     f"Finished creating shared memory file for {exchange}: {shared_memory_file}"
                 )
         exchanges = config["backtest"]["exchanges"]
-        exchanges_fname = "combined" if config["backtest"]["combine_ohlcvs"] else "_".join(exchanges)
+        exchanges_fname = (
+            "combined" if config["backtest"]["combine_ohlcvs"] else "_".join(exchanges)
+        )
         date_fname = ts_to_date_utc(utc_ms())[:19].replace(":", "_")
-        coins = sorted(set([x for y in config["backtest"]["coins"].values() for x in y]))
+        coins = sorted(
+            set([x for y in config["backtest"]["coins"].values() for x in y])
+        )
         coins_fname = "_".join(coins) if len(coins) <= 6 else f"{len(coins)}_coins"
         hash_snippet = uuid4().hex[:8]
         n_days = int(
@@ -977,12 +1042,18 @@ async def main():
         # Prepare BTC/USD data
         # For optimization, use the BTC/USD prices from the first exchange (or combined)
         # Since all exchanges should align in timesteps, this should be consistent
-        btc_usd_data = btc_usd_prices  # Use the fetched btc_usd_prices from prepare_hlcvs_mss
+        btc_usd_data = (
+            btc_usd_prices  # Use the fetched btc_usd_prices from prepare_hlcvs_mss
+        )
         if config["backtest"].get("use_btc_collateral", False):
             logging.info("Using fetched BTC/USD prices for collateral")
         else:
-            logging.info("Using default BTC/USD prices (all 1.0s) as use_btc_collateral is False")
-            btc_usd_data = np.ones(hlcvs_dict[next(iter(hlcvs_dict))].shape[0], dtype=np.float64)
+            logging.info(
+                "Using default BTC/USD prices (all 1.0s) as use_btc_collateral is False"
+            )
+            btc_usd_data = np.ones(
+                hlcvs_dict[next(iter(hlcvs_dict))].shape[0], dtype=np.float64
+            )
 
         validate_array(btc_usd_data, "btc_usd_data")
         btc_usd_shared_memory_file = create_shared_memory_file(btc_usd_data)
@@ -1049,7 +1120,9 @@ async def main():
         toolbox.register("select", tools.selNSGA2)
 
         # Parallelization setup
-        logging.info(f"Initializing multiprocessing pool. N cpus: {config['optimize']['n_cpus']}")
+        logging.info(
+            f"Initializing multiprocessing pool. N cpus: {config['optimize']['n_cpus']}"
+        )
         pool = multiprocessing.Pool(processes=config["optimize"]["n_cpus"])
         toolbox.register("map", pool.map)
         logging.info(f"Finished initializing multiprocessing pool.")
@@ -1063,7 +1136,9 @@ async def main():
             param_bounds,
             config["optimize"]["round_to_n_significant_digits"],
         )
-        if (nstart := len(starting_individuals)) > (popsize := config["optimize"]["population_size"]):
+        if (nstart := len(starting_individuals)) > (
+            popsize := config["optimize"]["population_size"]
+        ):
             logging.info(f"Number of starting configs greater than population size.")
             logging.info(f"Increasing population size: {popsize} -> {nstart}")
             config["optimize"]["population_size"] = nstart
@@ -1144,8 +1219,12 @@ async def main():
                     except Exception as e:
                         logging.error(f"Error removing shared memory file: {e}")
         if "btc_usd_shared_memory_file" in locals():
-            if btc_usd_shared_memory_file and os.path.exists(btc_usd_shared_memory_file):
-                logging.info(f"Removing BTC/USD shared memory file: {btc_usd_shared_memory_file}")
+            if btc_usd_shared_memory_file and os.path.exists(
+                btc_usd_shared_memory_file
+            ):
+                logging.info(
+                    f"Removing BTC/USD shared memory file: {btc_usd_shared_memory_file}"
+                )
                 try:
                     os.unlink(btc_usd_shared_memory_file)
                 except Exception as e:
