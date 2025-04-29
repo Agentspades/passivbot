@@ -583,6 +583,14 @@
         "hyperliquid": 1630540800000,
         "okx": 1630454400000
     },
+    "DYM": {
+        "binanceusdm": 1707264000000,
+        "bitget": 0.0,
+        "bybit": 1707264000000,
+        "gateio": 0.0,
+        "hyperliquid": 1706745600000,
+        "okx": 0.0
+    },
     "E": {
         "binanceusdm": 0.0,
         "bitget": 0.0,
@@ -1855,6 +1863,14 @@
         "hyperliquid": 0.0,
         "okx": 0.0
     },
+    "VVV": {
+        "binanceusdm": 1738108800000,
+        "bitget": 0.0,
+        "bybit": 1738022400000,
+        "gateio": 0.0,
+        "hyperliquid": 1737590400000,
+        "okx": 0.0
+    },
     "W": {
         "binanceusdm": 1712102400000,
         "bitget": 0.0,
@@ -2006,6 +2022,14 @@
         "gateio": 1598745600000,
         "hyperliquid": 0.0,
         "okx": 1598918400000
+    },
+    "ZBCN": {
+        "binanceusdm": 0.0,
+        "bitget": 0.0,
+        "bybit": 1713312000000,
+        "gateio": 0.0,
+        "hyperliquid": 0.0,
+        "okx": 0.0
     },
     "ZEC": {
         "binanceusdm": 1580860800000,

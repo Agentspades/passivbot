@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 import os
+
+try:
+    os.nice(10)  # Lower priority
+except Exception:
+    pass
 import sys
 import argparse
 import asyncio
@@ -55,7 +60,7 @@ logging.basicConfig(
 class ResourceManager:
     """Manages CPU and memory resources for optimization"""
 
-    def __init__(self, max_cpu_percent=70, max_memory_percent=80, check_interval=5):
+    def __init__(self, max_cpu_percent=90, max_memory_percent=80, check_interval=2):
         self.max_cpu_percent = max_cpu_percent
         self.max_memory_percent = max_memory_percent
         self.check_interval = check_interval
@@ -494,7 +499,7 @@ class OptimizationServer(DistributedOptimizer):
 
         for client_id, client_info in self.clients.items():
             # Check if client hasn't sent a heartbeat in 120 seconds (increased from 60)
-            if current_time - client_info["last_seen"] > 120:
+            if current_time - client_info["last_seen"] > 600:
                 logging.warning(
                     f"Client {client_id} ({client_info['hostname']}) appears to be disconnected"
                 )
@@ -1028,11 +1033,11 @@ class OptimizationClient(DistributedOptimizer):
 
     async def run(self):
         """Main client loop"""
-        await self.setup()
-
-        # Start background tasks
+        # Start heartbeat immediately
         heartbeat_task = asyncio.create_task(self.heartbeat_loop())
+        await self.setup()
         status_task = asyncio.create_task(self.status_listener())
+        adaptive_task = asyncio.create_task(self.adaptive_worker_count())
 
         # Main message handling loop
         while True:
@@ -1091,6 +1096,24 @@ class OptimizationClient(DistributedOptimizer):
                     logging.error(f"Error removing shared memory file: {e}")
 
 
+async def adaptive_worker_count(self):
+    """Dynamically adjust worker count based on system load (CPU and memory)."""
+    min_workers = 1
+    max_workers = cpu_count() - 1
+    target_cpu = self.max_cpu_percent
+    target_mem = self.max_memory_percent
+    while True:
+        cpu = psutil.cpu_percent(interval=1)
+        mem = psutil.virtual_memory().percent
+        # Only increase if both CPU and memory are below target
+        if cpu < target_cpu - 10 and mem < target_mem - 10:
+            self.n_workers = min(self.n_workers + 1, max_workers)
+        # Decrease if either is above target
+        elif cpu > target_cpu + 5 or mem > target_mem + 5:
+            self.n_workers = max(self.n_workers - 1, min_workers)
+        await asyncio.sleep(2)
+
+
 async def main():
     """Main entry point"""
     # Ensure Rust code is compiled
@@ -1145,6 +1168,12 @@ async def main():
         type=int,
         default=0,
         help="Number of worker processes (0 = auto, client mode only)",
+    )
+    parser.add_argument(
+        "--aggressiveness",
+        type=float,
+        default=1.0,
+        help="Aggressiveness factor (0.1-1.0, default 1.0, lower = more gentle on system)",
     )
 
     args = parser.parse_args()

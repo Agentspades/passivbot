@@ -1264,6 +1264,27 @@ class OptimizationClient(DistributedOptimizer):
 
             await asyncio.sleep(1)  # Check frequently but don't busy-wait
 
+    async def adaptive_worker_count(self):
+        min_workers = 1
+        max_workers = cpu_count()
+        target_cpu = self.max_cpu_percent
+        target_gpu = self.max_gpu_percent if self.use_gpu else 100
+        while True:
+            cpu = psutil.cpu_percent(interval=1)
+            gpu_percent = 0
+            if self.use_gpu:
+                try:
+                    gpu_mem_used, gpu_mem_total = cp.cuda.runtime.memGetInfo()
+                    gpu_percent = 100 * (1 - gpu_mem_used / gpu_mem_total)
+                except Exception:
+                    gpu_percent = 0
+            # Adjust based on both CPU and GPU
+            if cpu < target_cpu - 10 and gpu_percent < target_gpu - 10:
+                self.n_workers = min(self.n_workers + 1, max_workers)
+            elif cpu > target_cpu + 5 or gpu_percent > target_gpu + 5:
+                self.n_workers = max(self.n_workers - 1, min_workers)
+            await asyncio.sleep(2)
+
     async def run(self):
         """Main client loop"""
         await self.setup()
@@ -1271,6 +1292,7 @@ class OptimizationClient(DistributedOptimizer):
         # Start background tasks
         heartbeat_task = asyncio.create_task(self.heartbeat_loop())
         status_task = asyncio.create_task(self.status_listener())
+        adaptive_task = asyncio.create_task(self.adaptive_worker_count())
 
         # Main message handling loop
         while True:
