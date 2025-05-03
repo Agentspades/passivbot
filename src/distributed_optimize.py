@@ -497,7 +497,9 @@ class OptimizationServer(DistributedOptimizer):
         current_time = time.time()
         disconnected_clients = []
 
-        for client_id, client_info in self.clients.items():
+        for client_id, client_info in list(
+            self.clients.items()
+        ):  # Use list() to avoid modification during iteration
             # Check if client hasn't sent a heartbeat in 120 seconds (increased from 60)
             if current_time - client_info["last_seen"] > 600:
                 logging.warning(
@@ -514,7 +516,8 @@ class OptimizationServer(DistributedOptimizer):
 
         # Remove disconnected clients
         for client_id in disconnected_clients:
-            self.clients.pop(client_id)
+            if client_id in self.clients:  # Check again to avoid KeyError
+                self.clients.pop(client_id)
 
     async def broadcast_status(self):
         """Broadcast system status to all clients"""
@@ -731,14 +734,51 @@ class OptimizationClient(DistributedOptimizer):
         self.server_address = args.server
         self.hostname = socket.gethostname()
 
-        # Resource management
+        # Resource management - adjust defaults to be more aggressive
         self.max_cpu_percent = args.max_cpu
         self.max_memory_percent = args.max_memory
+        self.aggressiveness = (
+            args.aggressiveness if hasattr(args, "aggressiveness") else 1.0
+        )
+
+        # Adjust resource limits based on aggressiveness
+        self.target_cpu_percent = max(
+            30, self.max_cpu_percent - 20
+        )  # Target slightly below max
+        self.target_memory_percent = max(30, self.max_memory_percent - 20)
+
         self.resource_manager = ResourceManager(
             max_cpu_percent=self.max_cpu_percent,
             max_memory_percent=self.max_memory_percent,
         )
-        self.n_workers = args.workers if args.workers > 0 else max(1, cpu_count() - 1)
+
+        # Start with more workers based on system
+        total_cpus = cpu_count()
+        logical_cpus = psutil.cpu_count(logical=True)
+        physical_cpus = psutil.cpu_count(logical=False)
+
+        # Log CPU information
+        logging.info(
+            f"System has {physical_cpus} physical cores, {logical_cpus} logical cores"
+        )
+
+        if args.workers > 0:
+            self.n_workers = args.workers
+        else:
+            # More aggressive default worker count based on system type
+            if sys.platform == "darwin":  # macOS - be a bit more conservative
+                self.n_workers = max(1, int(physical_cpus * 0.7 * self.aggressiveness))
+            elif (
+                sys.platform == "win32" and logical_cpus > physical_cpus * 1.5
+            ):  # Windows with hyperthreading
+                # On systems with hyperthreading, we can use more workers
+                self.n_workers = max(1, int(logical_cpus * 0.7 * self.aggressiveness))
+            else:  # Linux or other systems
+                self.n_workers = max(1, int(total_cpus * 0.7 * self.aggressiveness))
+
+        logging.info(
+            f"Starting with {self.n_workers} workers (out of {total_cpus} CPUs)"
+        )
 
         # ZMQ sockets
         self.dealer_socket = self.context.socket(zmq.DEALER)
@@ -751,6 +791,13 @@ class OptimizationClient(DistributedOptimizer):
         self.shared_memory_files = {}
         self.hlcvs_dict = {}
         self.btc_usd_data_dict = {}
+
+        # Performance tracking
+        self.last_cpu_readings = []
+        self.last_mem_readings = []
+        self.max_readings = 5  # Number of readings to keep for smoothing
+        self.last_worker_adjustment = time.time()
+        self.adjustment_cooldown = 5  # Seconds between worker count adjustments
 
     async def setup(self):
         """Connect to server and register"""
@@ -815,52 +862,98 @@ class OptimizationClient(DistributedOptimizer):
         btc_usd_shared_memory_files = {}
         btc_usd_dtypes = {}
 
-        self.config["backtest"]["coins"] = {}
+        # Ensure the config has a coins section
+        if "coins" not in self.config["backtest"]:
+            self.config["backtest"]["coins"] = {}
+
+        # Debug: Print current config state
+        logging.info(
+            f"Current config exchanges: {self.config['backtest']['exchanges']}"
+        )
+        logging.info(f"Current approved coins: {self.config['live']['approved_coins']}")
+
+        # Try to get all eligible coins directly
+        try:
+            # First approach: Use the add_all_eligible_coins_to_config function
+            await add_all_eligible_coins_to_config(self.config)
+            logging.info(
+                f"After add_all_eligible_coins_to_config: {self.config['live']['approved_coins']}"
+            )
+
+            # If that didn't work, try a direct approach
+            if not any(self.config["live"]["approved_coins"].values()):
+                all_coins = await get_all_eligible_coins(
+                    self.config["backtest"]["exchanges"]
+                )
+                logging.info(
+                    f"Direct approach found {len(all_coins)} coins: {all_coins[:10]}..."
+                )
+
+                if all_coins:
+                    self.config["live"]["approved_coins"] = {
+                        "long": all_coins,
+                        "short": all_coins,
+                    }
+                    logging.info(f"Updated approved_coins with direct approach")
+        except Exception as e:
+            logging.error(f"Error getting eligible coins: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+        # Manually specify some common coins if we still don't have any
+        if not any(self.config["live"]["approved_coins"].values()):
+            logging.warning(
+                "No coins found automatically, using fallback list of common coins"
+            )
+            common_coins = [
+                "BTC",
+                "ETH",
+                "SOL",
+                "XRP",
+                "ADA",
+                "DOGE",
+                "MATIC",
+                "DOT",
+                "LINK",
+                "AVAX",
+            ]
+            self.config["live"]["approved_coins"] = {
+                "long": common_coins,
+                "short": common_coins,
+            }
+
+        # Now prepare the backtest coins based on approved coins
+        if not self.config["backtest"].get("coins"):
+            self.config["backtest"]["coins"] = {}
+
+        for exchange in self.config["backtest"]["exchanges"]:
+            if exchange not in self.config["backtest"]["coins"]:
+                self.config["backtest"]["coins"][exchange] = []
+
+            # Add approved coins to backtest coins if not already there
+            for side in ["long", "short"]:
+                for coin in self.config["live"]["approved_coins"].get(side, []):
+                    if coin not in self.config["backtest"]["coins"][exchange]:
+                        self.config["backtest"]["coins"][exchange].append(coin)
+
+        # Debug: Print final coin configuration
+        for exchange in self.config["backtest"]["exchanges"]:
+            logging.info(
+                f"Exchange {exchange} coins: {self.config['backtest']['coins'].get(exchange, [])}"
+            )
+
+        if not any(self.config["backtest"]["coins"].values()):
+            logging.error("No eligible coins found in configuration after all attempts")
+            raise ValueError(
+                "No eligible coins found. Please check your configuration."
+            )
 
         if self.config["backtest"]["combine_ohlcvs"]:
             exchange = "combined"
-            coins, hlcvs, mss, results_path, cache_dir, btc_usd_prices = (
-                await prepare_hlcvs_mss(self.config, exchange)
-            )
-            self.config["backtest"]["coins"][exchange] = coins
-            self.hlcvs_dict[exchange] = hlcvs
-            hlcvs_shapes[exchange] = hlcvs.shape
-            hlcvs_dtypes[exchange] = hlcvs.dtype
-            msss[exchange] = mss
-
-            required_space = hlcvs.nbytes * 1.1  # Add 10% buffer
-            check_disk_space(tempfile.gettempdir(), required_space)
-
-            logging.info(f"Creating shared memory file for {exchange}...")
-            validate_array(hlcvs, "hlcvs")
-            shared_memory_file = create_shared_memory_file(hlcvs)
-            self.shared_memory_files[exchange] = shared_memory_file
-
-            if self.config["backtest"].get("use_btc_collateral", False):
-                self.btc_usd_data_dict[exchange] = btc_usd_prices
-            else:
-                self.btc_usd_data_dict[exchange] = np.ones(
-                    hlcvs.shape[0], dtype=np.float64
-                )
-
-            validate_array(
-                self.btc_usd_data_dict[exchange], f"btc_usd_data for {exchange}"
-            )
-            btc_usd_shared_memory_files[exchange] = create_shared_memory_file(
-                self.btc_usd_data_dict[exchange]
-            )
-            btc_usd_dtypes[exchange] = self.btc_usd_data_dict[exchange].dtype
-
-        else:
-            tasks = {}
-            for exchange in self.config["backtest"]["exchanges"]:
-                tasks[exchange] = asyncio.create_task(
-                    prepare_hlcvs_mss(self.config, exchange)
-                )
-
-            for exchange in self.config["backtest"]["exchanges"]:
+            try:
                 coins, hlcvs, mss, results_path, cache_dir, btc_usd_prices = (
-                    await tasks[exchange]
+                    await prepare_hlcvs_mss(self.config, exchange)
                 )
                 self.config["backtest"]["coins"][exchange] = coins
                 self.hlcvs_dict[exchange] = hlcvs
@@ -868,7 +961,7 @@ class OptimizationClient(DistributedOptimizer):
                 hlcvs_dtypes[exchange] = hlcvs.dtype
                 msss[exchange] = mss
 
-                required_space = hlcvs.nbytes * 1.1
+                required_space = hlcvs.nbytes * 1.1  # Add 10% buffer
                 check_disk_space(tempfile.gettempdir(), required_space)
 
                 logging.info(f"Creating shared memory file for {exchange}...")
@@ -890,6 +983,68 @@ class OptimizationClient(DistributedOptimizer):
                     self.btc_usd_data_dict[exchange]
                 )
                 btc_usd_dtypes[exchange] = self.btc_usd_data_dict[exchange].dtype
+            except Exception as e:
+                logging.error(f"Error preparing combined data: {e}")
+                import traceback
+
+                traceback.print_exc()
+
+        else:
+            tasks = {}
+            for exchange in self.config["backtest"]["exchanges"]:
+                tasks[exchange] = asyncio.create_task(
+                    prepare_hlcvs_mss(self.config, exchange)
+                )
+
+            for exchange in self.config["backtest"]["exchanges"]:
+                try:
+                    coins, hlcvs, mss, results_path, cache_dir, btc_usd_prices = (
+                        await tasks[exchange]
+                    )
+
+                    if not coins:
+                        logging.warning(f"No coins found for exchange {exchange}")
+                        continue
+
+                    self.config["backtest"]["coins"][exchange] = coins
+                    self.hlcvs_dict[exchange] = hlcvs
+                    hlcvs_shapes[exchange] = hlcvs.shape
+                    hlcvs_dtypes[exchange] = hlcvs.dtype
+                    msss[exchange] = mss
+
+                    required_space = hlcvs.nbytes * 1.1
+                    check_disk_space(tempfile.gettempdir(), required_space)
+
+                    logging.info(f"Creating shared memory file for {exchange}...")
+                    validate_array(hlcvs, "hlcvs")
+                    shared_memory_file = create_shared_memory_file(hlcvs)
+                    self.shared_memory_files[exchange] = shared_memory_file
+
+                    if self.config["backtest"].get("use_btc_collateral", False):
+                        self.btc_usd_data_dict[exchange] = btc_usd_prices
+                    else:
+                        self.btc_usd_data_dict[exchange] = np.ones(
+                            hlcvs.shape[0], dtype=np.float64
+                        )
+
+                    validate_array(
+                        self.btc_usd_data_dict[exchange], f"btc_usd_data for {exchange}"
+                    )
+                    btc_usd_shared_memory_files[exchange] = create_shared_memory_file(
+                        self.btc_usd_data_dict[exchange]
+                    )
+                    btc_usd_dtypes[exchange] = self.btc_usd_data_dict[exchange].dtype
+                except Exception as e:
+                    logging.error(f"Error preparing data for {exchange}: {e}")
+                    import traceback
+
+                    traceback.print_exc()
+
+        # Check if we have any valid exchanges with data
+        if not self.shared_memory_files:
+            raise ValueError(
+                "No valid exchanges with coin data found. Please check your configuration."
+            )
 
         # Create results queue for evaluator
         self.results_queue = asyncio.Queue()
@@ -923,7 +1078,7 @@ class OptimizationClient(DistributedOptimizer):
 
         results = []
 
-        # Create a worker pool based on configured number of workers
+        # Create a worker pool based on current worker count (which may change dynamically)
         worker_semaphore = asyncio.Semaphore(self.n_workers)
 
         # Process individuals with resource management
@@ -949,7 +1104,7 @@ class OptimizationClient(DistributedOptimizer):
         # Signal ready for more tasks
         await self.dealer_socket.send(json.dumps({"type": "ready"}).encode())
 
-        logging.info(f"Completed task {task_id}")
+        logging.info(f"Completed task {task_id} with {len(results)} valid results")
 
     async def process_individual(self, individual, overrides_list, worker_semaphore):
         """Process a single individual with resource management"""
@@ -1053,6 +1208,25 @@ class OptimizationClient(DistributedOptimizer):
                 elif message["type"] == "ack":
                     # Heartbeat acknowledgment, nothing to do
                     pass
+                elif message["type"] == "reregister":
+                    # Server doesn't recognize us, re-register
+                    logging.info("Server requested re-registration")
+                    resource_info = {
+                        "cpu_count": cpu_count(),
+                        "workers": self.n_workers,
+                        "max_cpu_percent": self.max_cpu_percent,
+                        "max_memory_percent": self.max_memory_percent,
+                        "total_memory": psutil.virtual_memory().total,
+                    }
+                    await self.dealer_socket.send(
+                        json.dumps(
+                            {
+                                "type": "register",
+                                "hostname": self.hostname,
+                                "resources": resource_info,
+                            }
+                        ).encode()
+                    )
                 else:
                     logging.info(f"Received message: {message['type']}")
 
@@ -1095,23 +1269,155 @@ class OptimizationClient(DistributedOptimizer):
                 except Exception as e:
                     logging.error(f"Error removing shared memory file: {e}")
 
+    async def adaptive_worker_count(self):
+        """Dynamically adjust worker count based on system load (CPU and memory)."""
+        min_workers = 1
+        max_workers = cpu_count()  # Allow using all CPUs if system is idle
 
-async def adaptive_worker_count(self):
-    """Dynamically adjust worker count based on system load (CPU and memory)."""
-    min_workers = 1
-    max_workers = cpu_count() - 1
-    target_cpu = self.max_cpu_percent
-    target_mem = self.max_memory_percent
-    while True:
-        cpu = psutil.cpu_percent(interval=1)
-        mem = psutil.virtual_memory().percent
-        # Only increase if both CPU and memory are below target
-        if cpu < target_cpu - 10 and mem < target_mem - 10:
-            self.n_workers = min(self.n_workers + 1, max_workers)
-        # Decrease if either is above target
-        elif cpu > target_cpu + 5 or mem > target_mem + 5:
-            self.n_workers = max(self.n_workers - 1, min_workers)
-        await asyncio.sleep(2)
+        # On macOS, check if we're on battery power
+        on_battery = False
+        if sys.platform == "darwin":
+            try:
+                # Check if on battery on macOS
+                power_info = os.popen("pmset -g batt").read()
+                on_battery = "Battery Power" in power_info
+                if on_battery:
+                    logging.info(
+                        "Running on battery power - will be more conservative with resources"
+                    )
+                    max_workers = max(
+                        1, int(max_workers * 0.5)
+                    )  # Reduce max workers on battery
+            except:
+                pass
+
+        # On Windows, check if we're on battery power
+        elif sys.platform == "win32":
+            try:
+                import ctypes
+
+                status = ctypes.c_int()
+                ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status))
+                on_battery = not (status.value & 0x8)  # AC power flag
+                if on_battery:
+                    logging.info(
+                        "Running on battery power - will be more conservative with resources"
+                    )
+                    max_workers = max(
+                        1, int(max_workers * 0.5)
+                    )  # Reduce max workers on battery
+            except:
+                pass
+
+        while True:
+            current_time = time.time()
+
+            # Get current system metrics
+            cpu = psutil.cpu_percent(interval=0.5)
+            mem = psutil.virtual_memory().percent
+
+            # Add to rolling averages
+            self.last_cpu_readings.append(cpu)
+            self.last_mem_readings.append(mem)
+
+            # Keep only the most recent readings
+            if len(self.last_cpu_readings) > self.max_readings:
+                self.last_cpu_readings.pop(0)
+            if len(self.last_mem_readings) > self.max_readings:
+                self.last_mem_readings.pop(0)
+
+            # Calculate smoothed values
+            avg_cpu = sum(self.last_cpu_readings) / len(self.last_cpu_readings)
+            avg_mem = sum(self.last_mem_readings) / len(self.last_mem_readings)
+
+            # Check if we should adjust worker count (with cooldown)
+            if current_time - self.last_worker_adjustment >= self.adjustment_cooldown:
+                old_workers = self.n_workers
+
+                # Detect if system is mostly idle
+                system_idle = avg_cpu < 20 and not on_battery
+
+                # Adjust worker count based on system load and aggressiveness
+                if system_idle:
+                    # System is idle, be more aggressive
+                    target_workers = int(max_workers * 0.8 * self.aggressiveness)
+                    self.n_workers = min(max(min_workers, target_workers), max_workers)
+                elif (
+                    avg_cpu < self.target_cpu_percent - 15
+                    and avg_mem < self.target_memory_percent - 15
+                ):
+                    # System has plenty of headroom, increase workers
+                    increase = max(1, int(self.n_workers * 0.2 * self.aggressiveness))
+                    self.n_workers = min(self.n_workers + increase, max_workers)
+                elif (
+                    avg_cpu > self.max_cpu_percent - 5
+                    or avg_mem > self.max_memory_percent - 5
+                ):
+                    # System is getting close to limits, decrease workers significantly
+                    decrease = max(1, int(self.n_workers * 0.3))
+                    self.n_workers = max(min_workers, self.n_workers - decrease)
+                elif (
+                    avg_cpu > self.target_cpu_percent + 5
+                    or avg_mem > self.target_memory_percent + 5
+                ):
+                    # System is above target but below max, decrease workers slightly
+                    decrease = max(1, int(self.n_workers * 0.1))
+                    self.n_workers = max(min_workers, self.n_workers - decrease)
+
+                # If worker count changed, log it
+                if self.n_workers != old_workers:
+                    logging.info(
+                        f"Adjusting workers: {old_workers} → {self.n_workers} "
+                        + f"(CPU: {avg_cpu:.1f}%, Mem: {avg_mem:.1f}%)"
+                    )
+                    self.last_worker_adjustment = current_time
+
+            # Check for foreground activity (different methods per OS)
+            user_active = False
+
+            if sys.platform == "darwin":
+                try:
+                    # Check if user is active on macOS by looking at window server CPU usage
+                    for proc in psutil.process_iter(["name", "cpu_percent"]):
+                        if (
+                            proc.info["name"] == "WindowServer"
+                            and proc.info["cpu_percent"] > 10
+                        ):
+                            user_active = True
+                            break
+                except:
+                    pass
+            elif sys.platform == "win32":
+                try:
+                    # Check if user is active on Windows
+                    import ctypes
+
+                    user_active = ctypes.windll.user32.GetForegroundWindow() != 0
+                except:
+                    pass
+            elif sys.platform.startswith("linux"):
+                try:
+                    # Check if user is active on Linux by looking at X server CPU usage
+                    for proc in psutil.process_iter(["name", "cpu_percent"]):
+                        if (
+                            proc.info["name"] in ["Xorg", "X", "wayland"]
+                            and proc.info["cpu_percent"] > 5
+                        ):
+                            user_active = True
+                            break
+                except:
+                    pass
+
+            # If user is active, temporarily reduce worker count
+            if user_active and self.n_workers > min_workers:
+                temp_workers = max(min_workers, int(self.n_workers * 0.5))
+                if temp_workers != self.n_workers:
+                    logging.info(
+                        f"User activity detected - temporarily reducing workers to {temp_workers}"
+                    )
+                    self.n_workers = temp_workers
+
+            await asyncio.sleep(2)
 
 
 async def main():
