@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
 import os
-
-try:
-    os.nice(10)  # Lower priority
-except Exception:
-    pass
 import sys
 import argparse
 import asyncio
@@ -17,9 +12,11 @@ import zmq
 import zmq.asyncio
 import numpy as np
 import psutil
+import tempfile
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 from typing import Dict, List, Tuple, Optional, Any
-from multiprocessing import cpu_count
 
 # Import from passivbot
 from optimize import (
@@ -48,7 +45,6 @@ from downloader import add_all_eligible_coins_to_config
 from pareto_store import ParetoStore
 from opt_utils import make_json_serializable, dominates
 
-
 # Configure logging
 logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(message)s",
@@ -56,11 +52,117 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 
+# Set process priority if possible
+try:
+    os.nice(10)  # Lower priority
+except Exception:
+    pass
+
+
+def dummy_task(x):
+    # Do some meaningless computation
+    result = 0
+    for i in range(1000000):
+        result += i
+    return result
+
+
+# Wrapper function for evaluating individuals in separate processes
+def evaluate_individual_wrapper(
+    individual,
+    overrides_list,
+    config,
+    shared_memory_files,
+    hlcvs_shapes,
+    hlcvs_dtypes,
+    btc_usd_shared_memory_files,
+    btc_usd_dtypes,
+    msss,
+):
+    """
+    Wrapper function for evaluating individuals in separate processes.
+    This needs to be at module level to be picklable for multiprocessing.
+    """
+    from optimize import Evaluator
+    import multiprocessing
+
+    # Create a queue for this process
+    queue = multiprocessing.Queue()
+
+    # Create evaluator
+    evaluator = Evaluator(
+        shared_memory_files=shared_memory_files,
+        hlcvs_shapes=hlcvs_shapes,
+        hlcvs_dtypes=hlcvs_dtypes,
+        btc_usd_shared_memory_files=btc_usd_shared_memory_files,
+        btc_usd_dtypes=btc_usd_dtypes,
+        msss=msss,
+        config=config,
+        results_queue=queue,
+        seen_hashes={},
+        duplicate_counter={"count": 0},
+    )
+
+    # Evaluate the individual
+    objectives = evaluator.evaluate(individual, overrides_list)
+
+    # Get result from queue
+    result = queue.get()
+
+    # Add individual to result
+    result["individual"] = individual
+
+    # Ensure config is present
+    if "config" not in result:
+        from optimize import individual_to_config, optimizer_overrides
+
+        result["config"] = individual_to_config(
+            individual, optimizer_overrides, overrides_list, template=config
+        )
+
+    return result
+
+
+async def get_all_eligible_coins(exchanges):
+    """
+    Get all eligible coins from the specified exchanges.
+    This is a fallback method if add_all_eligible_coins_to_config fails.
+    """
+    import ccxt.async_support as ccxt
+
+    all_coins = set()
+
+    for exchange_name in exchanges:
+        try:
+            # Create exchange instance
+            exchange_class = getattr(ccxt, exchange_name)
+            exchange = exchange_class()
+
+            # Fetch markets
+            markets = await exchange.fetch_markets()
+
+            # Extract coin symbols
+            for market in markets:
+                if market.get("type") == "swap" and market.get("active"):
+                    base = market.get("base", "")
+                    if "/" in base:
+                        base = base.split("/")[0]
+                    if base:
+                        all_coins.add(base)
+
+            # Close exchange
+            await exchange.close()
+
+        except Exception as e:
+            logging.error(f"Error fetching markets from {exchange_name}: {e}")
+
+    return list(all_coins)
+
 
 class ResourceManager:
     """Manages CPU and memory resources for optimization"""
 
-    def __init__(self, max_cpu_percent=90, max_memory_percent=80, check_interval=2):
+    def __init__(self, max_cpu_percent=90, max_memory_percent=85, check_interval=5):
         self.max_cpu_percent = max_cpu_percent
         self.max_memory_percent = max_memory_percent
         self.check_interval = check_interval
@@ -76,16 +178,16 @@ class ResourceManager:
 
         self.last_check = current_time
 
-        # Check CPU usage
-        cpu_percent = psutil.cpu_percent(interval=0.5)
+        # Check CPU usage - use interval=None for immediate reading
+        cpu_percent = psutil.cpu_percent(interval=None)
 
         # Check memory usage
         memory_percent = psutil.virtual_memory().percent
 
-        # Determine if we should pause
+        # Determine if we should pause - only if extremely high
         if (
-            cpu_percent > self.max_cpu_percent
-            or memory_percent > self.max_memory_percent
+            cpu_percent > self.max_cpu_percent + 5
+            or memory_percent > self.max_memory_percent + 5
         ):
             if not self.paused:
                 logging.info(
@@ -139,12 +241,13 @@ class OptimizationServer(DistributedOptimizer):
         self.param_bounds = None
         self.sig_digits = 6
         self.seen_hashes = {}
+        self.task_progress = {}
 
         # ZMQ sockets
         self.router_socket = self.context.socket(zmq.ROUTER)
         self.pub_socket = self.context.socket(zmq.PUB)
 
-        # Task generation parameters
+        # Task generation parameters - increased batch size
         self.batch_size = args.batch_size
         self.population_size = 100  # Will be updated from config
 
@@ -311,6 +414,10 @@ class OptimizationServer(DistributedOptimizer):
                 # Send more tasks
                 await self.send_tasks_to_client(client_id)
 
+        elif msg_type == "progress":
+            # Handle progress updates
+            await self.handle_progress_update(client_id, message)
+
         elif msg_type == "error":
             # Handle client errors
             task_id = message.get("task_id")
@@ -331,8 +438,44 @@ class OptimizationServer(DistributedOptimizer):
                 # Send more tasks
                 await self.send_tasks_to_client(client_id)
 
+    async def handle_progress_update(self, client_id, message):
+        """Handle progress updates from clients"""
+        task_id = message.get("task_id")
+        processed = message.get("processed", 0)
+        total = message.get("total", 0)
+        valid_results = message.get("valid_results", 0)
+
+        if task_id in self.pending_tasks:
+            # Update task progress
+            self.task_progress[task_id] = {
+                "client_id": client_id,
+                "processed": processed,
+                "total": total,
+                "valid_results": valid_results,
+                "last_update": time.time(),
+            }
+
+            # Log progress
+            logging.info(
+                f"Task {task_id} progress: {processed}/{total} ({valid_results} valid)"
+            )
+
+            # Broadcast progress to all clients
+            await self.pub_socket.send(
+                json.dumps(
+                    {
+                        "type": "task_progress",
+                        "task_id": task_id,
+                        "client_id": client_id,
+                        "processed": processed,
+                        "total": total,
+                        "valid_results": valid_results,
+                    }
+                ).encode()
+            )
+
     async def send_tasks_to_client(self, client_id):
-        """Send optimization tasks to a client"""
+        """Send optimization tasks to a client with adaptive batch sizing"""
         if not self.population:
             # No more tasks to send
             return
@@ -341,10 +484,27 @@ class OptimizationServer(DistributedOptimizer):
         if isinstance(client_id, bytes):
             client_id = client_id.decode("utf-8")
 
+        # Get client info
+        client_info = self.clients.get(client_id)
+        if not client_info:
+            return
+
+        # Determine batch size based on client resources
+        client_cpu_count = client_info.get("resources", {}).get("cpu_count", 4)
+        client_workers = client_info.get("resources", {}).get("workers", 2)
+
+        # Scale batch size based on client's worker count
+        # More powerful clients get larger batches
+        adaptive_batch_size = min(
+            max(
+                self.batch_size, client_workers * 3
+            ),  # At least 3 individuals per worker
+            len(self.population),
+        )
+
         # Get batch of individuals to evaluate
-        batch_size = min(self.batch_size, len(self.population))
-        individuals = self.population[:batch_size]
-        self.population = self.population[batch_size:]
+        individuals = self.population[:adaptive_batch_size]
+        self.population = self.population[adaptive_batch_size:]
 
         # Create task
         task_id = str(uuid.uuid4())
@@ -368,7 +528,7 @@ class OptimizationServer(DistributedOptimizer):
         # Update client status
         self.clients[client_id]["status"] = "busy"
         logging.info(
-            f"Sent task {task_id} with {len(individuals)} individuals to client {client_id}"
+            f"Sent task {task_id} with {len(individuals)} individuals to client {client_id} (workers: {client_workers})"
         )
 
     async def process_results(self, results):
@@ -500,7 +660,7 @@ class OptimizationServer(DistributedOptimizer):
         for client_id, client_info in list(
             self.clients.items()
         ):  # Use list() to avoid modification during iteration
-            # Check if client hasn't sent a heartbeat in 120 seconds (increased from 60)
+            # Check if client hasn't sent a heartbeat in 10 minutes (increased from 60 seconds)
             if current_time - client_info["last_seen"] > 600:
                 logging.warning(
                     f"Client {client_id} ({client_info['hostname']}) appears to be disconnected"
@@ -509,15 +669,65 @@ class OptimizationServer(DistributedOptimizer):
 
                 # If client had pending tasks, return them to the queue
                 for task_id, individuals in list(self.pending_tasks.items()):
-                    if task_id.startswith(client_id):
+                    if (
+                        task_id in self.task_progress
+                        and self.task_progress[task_id]["client_id"] == client_id
+                    ):
                         logging.info(f"Returning task {task_id} to queue")
                         self.population.extend(individuals)
                         self.pending_tasks.pop(task_id)
+
+                        # Remove from task progress
+                        if task_id in self.task_progress:
+                            del self.task_progress[task_id]
 
         # Remove disconnected clients
         for client_id in disconnected_clients:
             if client_id in self.clients:  # Check again to avoid KeyError
                 self.clients.pop(client_id)
+
+    async def monitor_tasks(self):
+        """Monitor tasks and restart any that appear stuck"""
+        while True:
+            current_time = time.time()
+            stuck_tasks = []
+
+            # Check for stuck tasks (no progress update in 10 minutes)
+            for task_id, individuals in list(self.pending_tasks.items()):
+                # Get task progress if available
+                task_progress = self.task_progress.get(task_id)
+
+                # Check if task is stuck
+                if task_progress:
+                    last_update = task_progress.get("last_update", 0)
+                    if current_time - last_update > 600:  # 10 minutes
+                        stuck_tasks.append((task_id, individuals))
+                else:
+                    # No progress info - check if task is old (created more than 15 minutes ago)
+                    # This is a fallback for tasks that never reported progress
+                    if (
+                        task_id in self.pending_tasks
+                        and current_time
+                        - self.pending_tasks.get(task_id, {}).get(
+                            "created_at", current_time
+                        )
+                        > 900
+                    ):
+                        stuck_tasks.append((task_id, individuals))
+
+            # Restart stuck tasks
+            for task_id, individuals in stuck_tasks:
+                logging.warning(
+                    f"Task {task_id} appears to be stuck - returning to queue"
+                )
+                self.pending_tasks.pop(task_id)
+                self.population.extend(individuals)
+
+                # Remove from task progress
+                if task_id in self.task_progress:
+                    del self.task_progress[task_id]
+
+            await asyncio.sleep(60)  # Check every minute
 
     async def broadcast_status(self):
         """Broadcast system status to all clients"""
@@ -539,6 +749,7 @@ class OptimizationServer(DistributedOptimizer):
 
         # Start background tasks
         asyncio.create_task(self.status_loop())
+        asyncio.create_task(self.monitor_tasks())
 
         # Main message handling loop
         while True:
@@ -664,6 +875,7 @@ class OptimizationServer(DistributedOptimizer):
                         val = parent2[i]
 
                     # Small mutation
+                    # Small mutation
                     param_name = list(self.param_bounds.keys())[i]
                     low, high = self.param_bounds[param_name]
 
@@ -734,12 +946,11 @@ class OptimizationClient(DistributedOptimizer):
         self.server_address = args.server
         self.hostname = socket.gethostname()
 
-        # Resource management - adjust defaults to be more aggressive
+        # Resource management - more aggressive defaults
         self.max_cpu_percent = args.max_cpu
         self.max_memory_percent = args.max_memory
-        self.aggressiveness = (
-            args.aggressiveness if hasattr(args, "aggressiveness") else 1.0
-        )
+        self.aggressiveness = args.aggressiveness
+        self.optimize_memory_flag = args.optimize_memory
 
         # Adjust resource limits based on aggressiveness
         self.target_cpu_percent = max(
@@ -752,8 +963,17 @@ class OptimizationClient(DistributedOptimizer):
             max_memory_percent=self.max_memory_percent,
         )
 
+        # Set process priority
+        self.set_process_priority()
+
+        # Detect CPU features
+        self.detect_cpu_features()
+
+        # Set CPU affinity if supported
+        self.set_cpu_affinity()
+
         # Start with more workers based on system
-        total_cpus = cpu_count()
+        total_cpus = multiprocessing.cpu_count()
         logical_cpus = psutil.cpu_count(logical=True)
         physical_cpus = psutil.cpu_count(logical=False)
 
@@ -780,6 +1000,12 @@ class OptimizationClient(DistributedOptimizer):
             f"Starting with {self.n_workers} workers (out of {total_cpus} CPUs)"
         )
 
+        # Create process pool for CPU-bound tasks
+        self.process_pool = ProcessPoolExecutor(max_workers=self.n_workers)
+
+        # Prewarm the process pool
+        self.prewarm_process_pool()
+
         # ZMQ sockets
         self.dealer_socket = self.context.socket(zmq.DEALER)
         self.sub_socket = self.context.socket(zmq.SUB)
@@ -791,6 +1017,11 @@ class OptimizationClient(DistributedOptimizer):
         self.shared_memory_files = {}
         self.hlcvs_dict = {}
         self.btc_usd_data_dict = {}
+        self.hlcvs_shapes = {}
+        self.hlcvs_dtypes = {}
+        self.btc_usd_dtypes = {}
+        self.btc_usd_shared_memory_files = {}
+        self.msss = {}
 
         # Performance tracking
         self.last_cpu_readings = []
@@ -798,6 +1029,187 @@ class OptimizationClient(DistributedOptimizer):
         self.max_readings = 5  # Number of readings to keep for smoothing
         self.last_worker_adjustment = time.time()
         self.adjustment_cooldown = 5  # Seconds between worker count adjustments
+
+    def set_process_priority(self):
+        """
+        Set process priority based on the client's configuration.
+        """
+        try:
+            # Get current process
+            p = psutil.Process(os.getpid())
+
+            if self.args.priority == "low":
+                # Set to below normal priority
+                if sys.platform == "win32":
+                    p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+                else:
+                    p.nice(10)  # Lower priority on Unix
+                logging.info("Set process priority to low")
+
+            elif self.args.priority == "normal":
+                # Set to normal priority
+                if sys.platform == "win32":
+                    p.nice(psutil.NORMAL_PRIORITY_CLASS)
+                else:
+                    p.nice(0)  # Normal priority on Unix
+                logging.info("Set process priority to normal")
+
+            elif self.args.priority == "high":
+                # Set to above normal priority
+                if sys.platform == "win32":
+                    p.nice(psutil.ABOVE_NORMAL_PRIORITY_CLASS)
+                else:
+                    p.nice(-10)  # Higher priority on Unix (requires root)
+                logging.info("Set process priority to high")
+
+        except Exception as e:
+            logging.warning(f"Could not set process priority: {e}")
+
+    def set_cpu_affinity(self):
+        """
+        Set CPU affinity to distribute processes across all available cores.
+        This can improve performance by preventing the OS from moving processes
+        between cores too frequently.
+        """
+        try:
+            # Only available on some platforms
+            if hasattr(os, "sched_getaffinity") and hasattr(os, "sched_setaffinity"):
+                # Get current process
+                pid = os.getpid()
+
+                # Get available CPUs
+                available_cpus = list(os.sched_getaffinity(pid))
+
+                # Log current affinity
+                logging.info(f"Current CPU affinity: {available_cpus}")
+
+                # We'll keep the current affinity as it's likely already optimal
+                # But we log it for debugging purposes
+        except Exception as e:
+            logging.debug(f"Could not get/set CPU affinity: {e}")
+
+    def detect_cpu_features(self):
+        """
+        Detect CPU features that could be used for optimization.
+        """
+        try:
+            import platform
+            import subprocess
+
+            cpu_info = {}
+
+            # Different approaches based on platform
+            if platform.system() == "Linux":
+                # Use lscpu on Linux
+                try:
+                    output = subprocess.check_output("lscpu", shell=True).decode()
+                    for line in output.split("\n"):
+                        if ":" in line:
+                            key, value = line.split(":", 1)
+                            cpu_info[key.strip()] = value.strip()
+                except:
+                    pass
+
+            elif platform.system() == "Darwin":  # macOS
+                # Use sysctl on macOS
+                try:
+                    output = subprocess.check_output(
+                        "sysctl -a | grep machdep.cpu", shell=True
+                    ).decode()
+                    for line in output.split("\n"):
+                        if ":" in line:
+                            key, value = line.split(":", 1)
+                            cpu_info[key.strip()] = value.strip()
+                except:
+                    pass
+
+            elif platform.system() == "Windows":
+                # Use wmic on Windows
+                try:
+                    output = subprocess.check_output(
+                        "wmic cpu get Name, NumberOfCores, NumberOfLogicalProcessors /format:list",
+                        shell=True,
+                    ).decode()
+                    for line in output.split("\n"):
+                        if "=" in line:
+                            key, value = line.split("=", 1)
+                            cpu_info[key.strip()] = value.strip()
+                except:
+                    pass
+
+            # Log CPU information
+            if cpu_info:
+                logging.info(f"CPU information: {cpu_info}")
+
+                # Check for specific optimizations
+                avx2_available = False
+                if platform.system() == "Linux":
+                    avx2_available = "avx2" in cpu_info.get("Flags", "").lower()
+                elif platform.system() == "Darwin":
+                    avx2_available = (
+                        "avx2" in cpu_info.get("machdep.cpu.features", "").lower()
+                    )
+
+                if avx2_available:
+                    logging.info(
+                        "AVX2 instructions available - Rust code should use these automatically"
+                    )
+
+        except Exception as e:
+            logging.debug(f"Could not detect CPU features: {e}")
+        # Create a simple CPU-bound task
+
+    def prewarm_process_pool(self):
+        """
+        Prewarm the process pool by submitting dummy tasks.
+        This creates the worker processes upfront so they're ready when real tasks arrive.
+        """
+        logging.info(f"Prewarming process pool with {self.n_workers} workers...")
+
+        # Submit one task per worker
+        futures = []
+        for i in range(self.n_workers):
+            futures.append(self.process_pool.submit(dummy_task, i))
+
+        # Wait for all tasks to complete
+        for future in futures:
+            future.result()
+
+        logging.info("Process pool prewarming complete")
+
+    def optimize_memory_usage(self):
+        """
+        Optimize memory usage by clearing unnecessary caches and
+        triggering garbage collection when memory usage is high.
+        """
+        if not self.optimize_memory_flag:
+            return False
+
+        import gc
+
+        # Get current memory usage
+        memory_percent = psutil.virtual_memory().percent
+
+        # If memory usage is high, take action
+        if memory_percent > self.max_memory_percent - 10:
+            logging.info(
+                f"Memory usage is high ({memory_percent}%) - optimizing memory"
+            )
+
+            # Force garbage collection
+            gc.collect()
+
+            # Clear any caches if they exist
+            if hasattr(self.evaluator, "cache"):
+                self.evaluator.cache.clear()
+
+            # Log memory after optimization
+            new_memory_percent = psutil.virtual_memory().percent
+            logging.info(f"Memory usage after optimization: {new_memory_percent}%")
+
+            return True
+
+        return False
 
     async def setup(self):
         """Connect to server and register"""
@@ -812,7 +1224,7 @@ class OptimizationClient(DistributedOptimizer):
 
         # Register with server
         resource_info = {
-            "cpu_count": cpu_count(),
+            "cpu_count": multiprocessing.cpu_count(),
             "workers": self.n_workers,
             "max_cpu_percent": self.max_cpu_percent,
             "max_memory_percent": self.max_memory_percent,
@@ -853,14 +1265,14 @@ class OptimizationClient(DistributedOptimizer):
         # Prepare data for each exchange
         self.hlcvs_dict = {}
         self.shared_memory_files = {}
-        hlcvs_shapes = {}
-        hlcvs_dtypes = {}
-        msss = {}
+        self.hlcvs_shapes = {}
+        self.hlcvs_dtypes = {}
+        self.msss = {}
 
         # Store per-exchange BTC arrays
         self.btc_usd_data_dict = {}
-        btc_usd_shared_memory_files = {}
-        btc_usd_dtypes = {}
+        self.btc_usd_shared_memory_files = {}
+        self.btc_usd_dtypes = {}
 
         # Ensure the config has a coins section
         if "coins" not in self.config["backtest"]:
@@ -874,6 +1286,7 @@ class OptimizationClient(DistributedOptimizer):
 
         # Try to get all eligible coins directly
         try:
+
             # First approach: Use the add_all_eligible_coins_to_config function
             await add_all_eligible_coins_to_config(self.config)
             logging.info(
@@ -957,9 +1370,9 @@ class OptimizationClient(DistributedOptimizer):
                 )
                 self.config["backtest"]["coins"][exchange] = coins
                 self.hlcvs_dict[exchange] = hlcvs
-                hlcvs_shapes[exchange] = hlcvs.shape
-                hlcvs_dtypes[exchange] = hlcvs.dtype
-                msss[exchange] = mss
+                self.hlcvs_shapes[exchange] = hlcvs.shape
+                self.hlcvs_dtypes[exchange] = hlcvs.dtype
+                self.msss[exchange] = mss
 
                 required_space = hlcvs.nbytes * 1.1  # Add 10% buffer
                 check_disk_space(tempfile.gettempdir(), required_space)
@@ -979,10 +1392,10 @@ class OptimizationClient(DistributedOptimizer):
                 validate_array(
                     self.btc_usd_data_dict[exchange], f"btc_usd_data for {exchange}"
                 )
-                btc_usd_shared_memory_files[exchange] = create_shared_memory_file(
+                self.btc_usd_shared_memory_files[exchange] = create_shared_memory_file(
                     self.btc_usd_data_dict[exchange]
                 )
-                btc_usd_dtypes[exchange] = self.btc_usd_data_dict[exchange].dtype
+                self.btc_usd_dtypes[exchange] = self.btc_usd_data_dict[exchange].dtype
             except Exception as e:
                 logging.error(f"Error preparing combined data: {e}")
                 import traceback
@@ -1008,9 +1421,9 @@ class OptimizationClient(DistributedOptimizer):
 
                     self.config["backtest"]["coins"][exchange] = coins
                     self.hlcvs_dict[exchange] = hlcvs
-                    hlcvs_shapes[exchange] = hlcvs.shape
-                    hlcvs_dtypes[exchange] = hlcvs.dtype
-                    msss[exchange] = mss
+                    self.hlcvs_shapes[exchange] = hlcvs.shape
+                    self.hlcvs_dtypes[exchange] = hlcvs.dtype
+                    self.msss[exchange] = mss
 
                     required_space = hlcvs.nbytes * 1.1
                     check_disk_space(tempfile.gettempdir(), required_space)
@@ -1030,10 +1443,12 @@ class OptimizationClient(DistributedOptimizer):
                     validate_array(
                         self.btc_usd_data_dict[exchange], f"btc_usd_data for {exchange}"
                     )
-                    btc_usd_shared_memory_files[exchange] = create_shared_memory_file(
-                        self.btc_usd_data_dict[exchange]
+                    self.btc_usd_shared_memory_files[exchange] = (
+                        create_shared_memory_file(self.btc_usd_data_dict[exchange])
                     )
-                    btc_usd_dtypes[exchange] = self.btc_usd_data_dict[exchange].dtype
+                    self.btc_usd_dtypes[exchange] = self.btc_usd_data_dict[
+                        exchange
+                    ].dtype
                 except Exception as e:
                     logging.error(f"Error preparing data for {exchange}: {e}")
                     import traceback
@@ -1046,30 +1461,10 @@ class OptimizationClient(DistributedOptimizer):
                 "No valid exchanges with coin data found. Please check your configuration."
             )
 
-        # Create results queue for evaluator
-        self.results_queue = asyncio.Queue()
-
-        # Import Evaluator class
-        from optimize import Evaluator
-
-        # Initialize evaluator with shared memory files
-        self.evaluator = Evaluator(
-            shared_memory_files=self.shared_memory_files,
-            hlcvs_shapes=hlcvs_shapes,
-            hlcvs_dtypes=hlcvs_dtypes,
-            btc_usd_shared_memory_files=btc_usd_shared_memory_files,
-            btc_usd_dtypes=btc_usd_dtypes,
-            msss=msss,
-            config=self.config,
-            results_queue=self.results_queue,
-            seen_hashes={},
-            duplicate_counter={"count": 0},
-        )
-
-        logging.info("Evaluator initialization complete")
+        logging.info("Data preparation complete")
 
     async def process_task(self, task):
-        """Process an optimization task"""
+        """Process an optimization task using process pool"""
         task_id = task["task_id"]
         individuals = task["individuals"]
         overrides_list = self.config.get("optimize", {}).get("enable_overrides", [])
@@ -1078,32 +1473,98 @@ class OptimizationClient(DistributedOptimizer):
         logging.info(f"Using {self.n_workers} worker processes")
 
         results = []
-
-        # Create a worker pool based on current worker count
-        worker_semaphore = asyncio.Semaphore(self.n_workers)
+        valid_results = 0
+        total_individuals = len(individuals)
+        processed = 0
 
         # Process individuals with resource management
-        tasks = []
-        for individual in individuals:
-            # Create a task for each individual
-            tasks.append(
-                self.process_individual(individual, overrides_list, worker_semaphore)
-            )
+        futures = []
 
-        # Wait for all individuals to be processed
+        # Submit all individuals to the process pool
+        for individual in individuals:
+            # Check if we should pause due to high resource usage
+            await self.resource_manager.wait_for_resources()
+
+            # Submit the task to the process pool
+            future = self.process_pool.submit(
+                evaluate_individual_wrapper,
+                individual,
+                overrides_list,
+                self.config,
+                self.shared_memory_files,
+                self.hlcvs_shapes,
+                self.hlcvs_dtypes,
+                self.btc_usd_shared_memory_files,
+                self.btc_usd_dtypes,
+                self.msss,
+            )
+            futures.append(future)
+
+        # Process results as they complete
         start_time = time.time()
-        for result in await asyncio.gather(*tasks):
-            if result:
-                results.append(result)
+        last_progress_time = start_time
+
+        for future in futures:
+            try:
+                # Wait for the future to complete
+                result = future.result()
+
+                if result:
+                    results.append(result)
+                    valid_results += 1
+
+                # Update progress
+                processed += 1
+                current_time = time.time()
+
+                # Send progress update every 5 seconds or every 10% of individuals
+                if (
+                    current_time - last_progress_time > 5
+                    or processed % max(1, total_individuals // 10) == 0
+                ):
+                    await self.dealer_socket.send(
+                        json.dumps(
+                            {
+                                "type": "progress",
+                                "task_id": task_id,
+                                "processed": processed,
+                                "total": total_individuals,
+                                "valid_results": valid_results,
+                            }
+                        ).encode()
+                    )
+                    last_progress_time = current_time
+
+                # Periodically optimize memory if enabled
+                if processed % 10 == 0:
+                    self.optimize_memory_usage()
+
+            except Exception as e:
+                logging.error(f"Error processing individual: {e}")
+                processed += 1  # Still count as processed even if it failed
 
         end_time = time.time()
         processing_time = end_time - start_time
 
         logging.info(
-            f"Processed {len(individuals)} individuals in {processing_time:.2f} seconds"
+            f"Processed {processed}/{total_individuals} individuals in {processing_time:.2f} seconds"
         )
         logging.info(
-            f"Average time per individual: {processing_time/len(individuals):.2f} seconds"
+            f"Average time per individual: {processing_time/total_individuals:.2f} seconds"
+        )
+        logging.info(f"Valid results: {valid_results}/{total_individuals}")
+
+        # Send final progress update
+        await self.dealer_socket.send(
+            json.dumps(
+                {
+                    "type": "progress",
+                    "task_id": task_id,
+                    "processed": processed,
+                    "total": total_individuals,
+                    "valid_results": valid_results,
+                }
+            ).encode()
         )
 
         # Send results back to server
@@ -1113,61 +1574,10 @@ class OptimizationClient(DistributedOptimizer):
             ).encode()
         )
 
-        # Signal ready for more tasks
+        # Signal ready for more tasks immediately
         await self.dealer_socket.send(json.dumps({"type": "ready"}).encode())
 
         logging.info(f"Completed task {task_id} with {len(results)} valid results")
-
-    async def process_individual(self, individual, overrides_list, worker_semaphore):
-        """Process a single individual with resource management"""
-        try:
-            # Check if we should pause due to high resource usage
-            await self.resource_manager.wait_for_resources()
-
-            # Acquire worker semaphore to limit concurrent evaluations
-            async with worker_semaphore:
-                # Log when we start processing this individual
-                start_time = time.time()
-
-                # Log CPU usage before evaluation
-                cpu_before = psutil.cpu_percent(interval=0.1)
-
-                # Evaluate individual - this is where the CPU-intensive work happens
-                objectives = self.evaluator.evaluate(individual, overrides_list)
-
-                # Get result from queue
-                result = await self.results_queue.get()
-
-                # Log CPU usage after evaluation
-                cpu_after = psutil.cpu_percent(interval=0.1)
-
-                # Add individual to result for tracking
-                result["individual"] = individual
-
-                # Ensure config is present in the result
-                if "config" not in result:
-                    # Create config from individual
-                    result["config"] = individual_to_config(
-                        individual,
-                        optimizer_overrides,
-                        overrides_list,
-                        template=self.config,
-                    )
-
-                # Log completion time and CPU usage
-                end_time = time.time()
-                logging.info(
-                    f"Individual processed in {end_time - start_time:.2f} seconds. CPU: {cpu_before:.1f}% → {cpu_after:.1f}%"
-                )
-
-                return result
-
-        except Exception as e:
-            logging.error(f"Error evaluating individual: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return None
 
     async def heartbeat_loop(self):
         """Send periodic heartbeats to server"""
@@ -1192,7 +1602,7 @@ class OptimizationClient(DistributedOptimizer):
             except Exception as e:
                 logging.error(f"Error sending heartbeat: {e}")
 
-            await asyncio.sleep(15)  # Send heartbeat every 15 seconds instead of 30
+            await asyncio.sleep(15)  # Send heartbeat every 15 seconds
 
     async def status_listener(self):
         """Listen for status broadcasts from server"""
@@ -1213,93 +1623,12 @@ class OptimizationClient(DistributedOptimizer):
 
             await asyncio.sleep(1)  # Check frequently but don't busy-wait
 
-    async def run(self):
-        """Main client loop"""
-        # Start heartbeat immediately
-        heartbeat_task = asyncio.create_task(self.heartbeat_loop())
-        await self.setup()
-        status_task = asyncio.create_task(self.status_listener())
-        adaptive_task = asyncio.create_task(self.adaptive_worker_count())
-
-        # Main message handling loop
-        while True:
-            try:
-                # Receive message from server
-                message = await self.dealer_socket.recv()
-                message = json.loads(message.decode())
-
-                if message["type"] == "task":
-                    # Process optimization task
-                    self.current_task = message
-                    await self.process_task(message)
-                elif message["type"] == "ack":
-                    # Heartbeat acknowledgment, nothing to do
-                    pass
-                elif message["type"] == "reregister":
-                    # Server doesn't recognize us, re-register
-                    logging.info("Server requested re-registration")
-                    resource_info = {
-                        "cpu_count": cpu_count(),
-                        "workers": self.n_workers,
-                        "max_cpu_percent": self.max_cpu_percent,
-                        "max_memory_percent": self.max_memory_percent,
-                        "total_memory": psutil.virtual_memory().total,
-                    }
-                    await self.dealer_socket.send(
-                        json.dumps(
-                            {
-                                "type": "register",
-                                "hostname": self.hostname,
-                                "resources": resource_info,
-                            }
-                        ).encode()
-                    )
-                else:
-                    logging.info(f"Received message: {message['type']}")
-
-            except Exception as e:
-                logging.error(f"Error in client loop: {e}")
-                import traceback
-
-                traceback.print_exc()
-
-                # If we were processing a task, report the error
-                if self.current_task:
-                    try:
-                        await self.dealer_socket.send(
-                            json.dumps(
-                                {
-                                    "type": "error",
-                                    "task_id": self.current_task["task_id"],
-                                    "error": str(e),
-                                }
-                            ).encode()
-                        )
-
-                        # Signal ready for more tasks
-                        await self.dealer_socket.send(
-                            json.dumps({"type": "ready"}).encode()
-                        )
-
-                        self.current_task = None
-                    except:
-                        pass
-
-    def cleanup(self):
-        """Clean up resources before exit"""
-        # Remove shared memory files
-        for shared_memory_file in self.shared_memory_files.values():
-            if shared_memory_file and os.path.exists(shared_memory_file):
-                logging.info(f"Removing shared memory file: {shared_memory_file}")
-                try:
-                    os.unlink(shared_memory_file)
-                except Exception as e:
-                    logging.error(f"Error removing shared memory file: {e}")
-
     async def adaptive_worker_count(self):
         """Dynamically adjust worker count based on system load (CPU and memory)."""
         min_workers = 1
-        max_workers = cpu_count()  # Allow using all CPUs if system is idle
+        max_workers = (
+            multiprocessing.cpu_count()
+        )  # Allow using all CPUs if system is idle
 
         # On macOS, check if we're on battery power
         on_battery = False
@@ -1391,13 +1720,29 @@ class OptimizationClient(DistributedOptimizer):
                     decrease = max(1, int(self.n_workers * 0.1))
                     self.n_workers = max(min_workers, self.n_workers - decrease)
 
-                # If worker count changed, log it
+                # If worker count changed, log it and update the process pool
                 if self.n_workers != old_workers:
                     logging.info(
                         f"Adjusting workers: {old_workers} → {self.n_workers} "
                         + f"(CPU: {avg_cpu:.1f}%, Mem: {avg_mem:.1f}%)"
                     )
                     self.last_worker_adjustment = current_time
+
+                    # Recreate the process pool with the new worker count
+                    # This is a bit expensive but ensures we adapt to changing conditions
+                    try:
+                        old_pool = self.process_pool
+                        self.process_pool = ProcessPoolExecutor(
+                            max_workers=self.n_workers
+                        )
+
+                        # Shutdown old pool gracefully
+                        old_pool.shutdown(wait=False)
+
+                        # Prewarm the new pool
+                        self.prewarm_process_pool()
+                    except Exception as e:
+                        logging.error(f"Error recreating process pool: {e}")
 
             # Check for foreground activity (different methods per OS)
             user_active = False
@@ -1446,6 +1791,105 @@ class OptimizationClient(DistributedOptimizer):
 
             await asyncio.sleep(2)
 
+    async def run(self):
+        """Main client loop"""
+        # Start heartbeat immediately
+        heartbeat_task = asyncio.create_task(self.heartbeat_loop())
+        await self.setup()
+        status_task = asyncio.create_task(self.status_listener())
+        adaptive_task = asyncio.create_task(self.adaptive_worker_count())
+
+        # Main message handling loop
+        while True:
+            try:
+                # Receive message from server
+                message = await self.dealer_socket.recv()
+                message = json.loads(message.decode())
+
+                if message["type"] == "task":
+                    # Process optimization task
+                    self.current_task = message
+                    await self.process_task(message)
+                elif message["type"] == "ack":
+                    # Heartbeat acknowledgment, nothing to do
+                    pass
+                elif message["type"] == "reregister":
+                    # Server doesn't recognize us, re-register
+                    logging.info("Server requested re-registration")
+                    resource_info = {
+                        "cpu_count": multiprocessing.cpu_count(),
+                        "workers": self.n_workers,
+                        "max_cpu_percent": self.max_cpu_percent,
+                        "max_memory_percent": self.max_memory_percent,
+                        "total_memory": psutil.virtual_memory().total,
+                    }
+                    await self.dealer_socket.send(
+                        json.dumps(
+                            {
+                                "type": "register",
+                                "hostname": self.hostname,
+                                "resources": resource_info,
+                            }
+                        ).encode()
+                    )
+                else:
+                    logging.info(f"Received message: {message['type']}")
+
+            except Exception as e:
+                logging.error(f"Error in client loop: {e}")
+                import traceback
+
+                traceback.print_exc()
+
+                # If we were processing a task, report the error
+                if self.current_task:
+                    try:
+                        await self.dealer_socket.send(
+                            json.dumps(
+                                {
+                                    "type": "error",
+                                    "task_id": self.current_task["task_id"],
+                                    "error": str(e),
+                                }
+                            ).encode()
+                        )
+
+                        # Signal ready for more tasks
+                        await self.dealer_socket.send(
+                            json.dumps({"type": "ready"}).encode()
+                        )
+
+                        self.current_task = None
+                    except:
+                        pass
+
+    def cleanup(self):
+        """Clean up resources before exit"""
+        # Shutdown process pool
+        if hasattr(self, "process_pool"):
+            logging.info("Shutting down process pool...")
+            self.process_pool.shutdown(wait=True)
+
+        # Remove shared memory files
+        for shared_memory_file in self.shared_memory_files.values():
+            if shared_memory_file and os.path.exists(shared_memory_file):
+                logging.info(f"Removing shared memory file: {shared_memory_file}")
+                try:
+                    os.unlink(shared_memory_file)
+                except Exception as e:
+                    logging.error(f"Error removing shared memory file: {e}")
+
+        # Remove BTC USD shared memory files
+        for shared_memory_file in self.btc_usd_shared_memory_files.values():
+            if shared_memory_file and os.path.exists(shared_memory_file):
+                logging.info(
+                    f"Removing BTC USD shared memory file: {shared_memory_file}"
+                )
+                try:
+                    os.unlink(shared_memory_file)
+                except Exception as e:
+                    logging.error(f"Error removing BTC USD shared memory file: {e}")
+
 
 async def main():
     """Main entry point"""
@@ -1454,7 +1898,7 @@ async def main():
 
     # Parse command line arguments
     parser = argparse.ArgumentParser(
-        description="Distributed optimization for Passivbot"
+        description="Distributed optimization for Passivbot with improved CPU utilization"
     )
     parser.add_argument(
         "--mode",
@@ -1474,7 +1918,7 @@ async def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=10,
+        default=25,  # Increased from 10 to 25
         help="Number of individuals to send in each task (server mode only)",
     )
 
@@ -1487,13 +1931,13 @@ async def main():
     parser.add_argument(
         "--max-cpu",
         type=int,
-        default=70,
+        default=85,  # Increased from 70 to 85
         help="Maximum CPU usage percentage (client mode only)",
     )
     parser.add_argument(
         "--max-memory",
         type=int,
-        default=80,
+        default=85,  # Increased from 80 to 85
         help="Maximum memory usage percentage (client mode only)",
     )
     parser.add_argument(
@@ -1507,6 +1951,18 @@ async def main():
         type=float,
         default=1.0,
         help="Aggressiveness factor (0.1-1.0, default 1.0, lower = more gentle on system)",
+    )
+    parser.add_argument(
+        "--priority",
+        type=str,
+        choices=["low", "normal", "high"],
+        default="normal",
+        help="Process priority (client mode only)",
+    )
+    parser.add_argument(
+        "--optimize-memory",
+        action="store_true",
+        help="Periodically optimize memory usage (client mode only)",
     )
 
     args = parser.parse_args()
@@ -1541,7 +1997,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    # Import tempfile here to avoid circular imports
-    import tempfile
-
     asyncio.run(main())
