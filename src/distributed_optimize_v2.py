@@ -2257,26 +2257,34 @@ async def process_individual(self, individual, overrides_list, worker_semaphore)
 
     def cleanup(self):
         """Clean up resources before exit"""
-        logging.info("Shutting down process pool...")
+        logging.info("Cleaning up resources...")
+
+        # Shutdown process pool
         if hasattr(self, "process_pool"):
+            logging.info("Shutting down process pool...")
             self.process_pool.shutdown(wait=False)
 
         # Remove shared memory files
         for shared_memory_file in self.shared_memory_files.values():
             if shared_memory_file and os.path.exists(shared_memory_file):
                 logging.info(f"Removing shared memory file: {shared_memory_file}")
-            try:
-                os.unlink(shared_memory_file)
-            except Exception as e:
-                logging.error(f"Error removing shared memory file: {e}")
+                try:
+                    os.unlink(shared_memory_file)
+                except Exception as e:
+                    logging.error(f"Error removing shared memory file: {e}")
 
         # Remove BTC USD shared memory files
         for shared_memory_file in self.btc_usd_shared_memory_files.values():
             if shared_memory_file and os.path.exists(shared_memory_file):
+                logging.info(
+                    f"Removing BTC USD shared memory file: {shared_memory_file}"
+                )
                 try:
                     os.unlink(shared_memory_file)
                 except Exception as e:
                     logging.error(f"Error removing BTC USD shared memory file: {e}")
+
+        logging.info("Cleanup complete")
 
 
 async def main():
