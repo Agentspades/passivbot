@@ -384,20 +384,20 @@ class OptimizationServer(DistributedOptimizer):
                 "status": "idle",
                 "tasks_completed": 0,
             }
-        logging.info(f"New client registered: {hostname} ({client_id})")
-        await self.router_socket.send_multipart(
-            [
-                client_id.encode() if isinstance(client_id, str) else client_id,
-                json.dumps({"type": "registered", "config": self.config}).encode(),
-            ]
-        )
+            logging.info(f"New client registered: {hostname} ({client_id})")
+            await self.router_socket.send_multipart(
+                [
+                    client_id.encode() if isinstance(client_id, str) else client_id,
+                    json.dumps({"type": "registered", "config": self.config}).encode(),
+                ]
+            )
 
-        # Clear any re-registration requests for this client
-        if (
-            hasattr(self, "reregister_requests")
-            and client_id in self.reregister_requests
-        ):
-            del self.reregister_requests[client_id]
+            # Clear any re-registration requests for this client
+            if (
+                hasattr(self, "reregister_requests")
+                and client_id in self.reregister_requests
+            ):
+                del self.reregister_requests[client_id]
 
         elif msg_type == "heartbeat":
             # Update client's last seen timestamp
