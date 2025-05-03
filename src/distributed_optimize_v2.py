@@ -698,7 +698,6 @@ class OptimizationServer(DistributedOptimizer):
             if client_id in self.clients:  # Check again to avoid KeyError
                 self.clients.pop(client_id)
 
-
     async def monitor_tasks(self):
         """Monitor tasks and restart any that appear stuck"""
         # Dictionary to track when tasks were created
@@ -708,8 +707,8 @@ class OptimizationServer(DistributedOptimizer):
             current_time = time.time()
             stuck_tasks = []
 
-                # Check for stuck tasks (no progress update in 10 minutes)
-                for task_id, individuals in list(self.pending_tasks.items()):
+            # Check for stuck tasks (no progress update in 10 minutes)
+            for task_id, individuals in list(self.pending_tasks.items()):
                 # Record creation time if not already tracked
                 if task_id not in task_creation_times:
                     task_creation_times[task_id] = current_time
@@ -731,7 +730,9 @@ class OptimizationServer(DistributedOptimizer):
 
             # Restart stuck tasks
             for task_id, individuals in stuck_tasks:
-                logging.warning(f"Task {task_id} appears to be stuck - returning to queue")
+                logging.warning(
+                    f"Task {task_id} appears to be stuck - returning to queue"
+                )
                 self.pending_tasks.pop(task_id)
                 self.population.extend(individuals)
 
