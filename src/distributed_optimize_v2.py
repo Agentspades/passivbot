@@ -352,19 +352,40 @@ class OptimizationServer(DistributedOptimizer):
 
         msg_type = message.get("type")
 
+        # Handle special message types
+        if msg_type == "not_ready":
+            # Client is not ready yet, don't send tasks
+            logging.info(f"Client {client_id} reported it's not ready yet")
+            return
+
         # Special handling for registration messages
         if msg_type == "register":
             # New client registration
             hostname = message.get("hostname", "unknown")
             resource_info = message.get("resources", {})
-            self.clients[client_id] = {
-                "hostname": hostname,
-                "resources": resource_info,
-                "last_seen": time.time(),
-                "status": "idle",
-                "tasks_completed": 0,
-            }
-            logging.info(f"New client registered: {hostname} ({client_id})")
+
+            # If client already exists, update its info
+            if client_id in self.clients:
+                self.clients[client_id].update(
+                    {
+                        "hostname": hostname,
+                        "resources": resource_info,
+                        "last_seen": time.time(),
+                    }
+                )
+                logging.info(f"Updated existing client: {hostname} ({client_id})")
+            else:
+                # New client
+                self.clients[client_id] = {
+                    "hostname": hostname,
+                    "resources": resource_info,
+                    "last_seen": time.time(),
+                    "status": "idle",
+                    "tasks_completed": 0,
+                }
+                logging.info(f"New client registered: {hostname} ({client_id})")
+
+            # Send registration confirmation
             await self.router_socket.send_multipart(
                 [
                     client_id.encode() if isinstance(client_id, str) else client_id,
@@ -380,8 +401,7 @@ class OptimizationServer(DistributedOptimizer):
                 del self.reregister_requests[client_id]
             return
 
-        # If client was previously marked as disconnected but is now sending messages,
-        # re-register it automatically (but only once)
+        # If client is not registered, request registration
         if client_id not in self.clients:
             # Use a class variable to track clients we've asked to re-register
             if not hasattr(self, "reregister_requests"):
@@ -1728,17 +1748,40 @@ class OptimizationClient(DistributedOptimizer):
                         )
                         await asyncio.sleep(1)  # Wait a bit before retrying
                         continue
+                    elif message["type"] == "task":
+                        # Server sent us a task before we're ready - ignore it and try again
+                        logging.error(
+                            f"Unexpected response during registration: {message}"
+                        )
+                        logging.info(
+                            "Server sent a task before registration was complete, retrying..."
+                        )
+                        # Send a message to server indicating we're not ready
+                        await self.dealer_socket.send(
+                            json.dumps(
+                                {
+                                    "type": "not_ready",
+                                    "message": "Client is still registering, please wait",
+                                }
+                            ).encode()
+                        )
+                        await asyncio.sleep(2)  # Wait a bit longer before retrying
+                        continue
                     else:
                         logging.error(
                             f"Unexpected response during registration: {message}"
                         )
-                        return False
+                        await asyncio.sleep(1)  # Wait a bit before retrying
+                        continue
                 except asyncio.TimeoutError:
                     logging.error("Registration timed out, retrying...")
                     continue
             except Exception as e:
                 logging.error(f"Error during registration: {e}")
-                return False
+                import traceback
+
+                traceback.print_exc()
+                await asyncio.sleep(2)  # Wait before retrying
 
         logging.error("Failed to register after multiple attempts")
         return False
@@ -1932,110 +1975,134 @@ class OptimizationClient(DistributedOptimizer):
 
     async def run(self):
         """Main client loop"""
-        # Start heartbeat immediately
+        # Set up process pool
+        self.process_pool = ProcessPoolExecutor(max_workers=self.n_workers)
+
+        # Prewarm the process pool
+        self.prewarm_process_pool()
+
+        # Connect to server
+        server_host, server_port = self.server_address.split(":")
+        self.dealer_socket.setsockopt(zmq.IDENTITY, self.node_id.encode())
+        self.dealer_socket.connect(f"tcp://{server_host}:{server_port}")
+        self.sub_socket.connect(f"tcp://{server_host}:{int(server_port)+1}")
+        self.sub_socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all messages
+
+        # Give ZMQ connections time to establish
+        await asyncio.sleep(1)
+
+        # Register with server
+        registration_success = await self.register_with_server()
+        if not registration_success:
+            logging.error("Failed to register with server, exiting")
+            self.cleanup()
+            return
+
+        # Start background tasks
         heartbeat_task = asyncio.create_task(self.heartbeat_loop())
-        await self.setup()
         status_task = asyncio.create_task(self.status_listener())
         adaptive_task = asyncio.create_task(self.adaptive_worker_count())
 
         # Track if we're currently processing a task
         self.is_processing_task = False
+
         # Track if we need to re-register after task completion
         self.pending_reregistration = False
 
-        # Main message handling loop
-        while True:
-            try:
-                # Receive message from server
-                message = await self.dealer_socket.recv()
-                message = json.loads(message.decode())
+        try:
+            # Main message handling loop
+            while True:
+                try:
+                    # Receive message from server
+                    message = await self.dealer_socket.recv()
+                    message = json.loads(message.decode())
 
-                if message["type"] == "task":
-                    # Process optimization task
-                    self.current_task = message
-                    self.is_processing_task = True
-                    await self.process_task(message)
-                    self.is_processing_task = False
+                    if message["type"] == "task":
+                        # Process optimization task
+                        self.current_task = message
+                        self.is_processing_task = True
+                        await self.process_task(message)
+                        self.is_processing_task = False
 
-                    # If we received re-registration requests during task processing,
-                    # handle them now
-                    if self.pending_reregistration:
-                        self.pending_reregistration = False
-                        await self.register_with_server()
+                        # If we received re-registration requests during task processing,
+                        # handle them now
+                        if self.pending_reregistration:
+                            self.pending_reregistration = False
+                            await self.register_with_server()
 
                     elif message["type"] == "ack":
                         # Heartbeat acknowledgment, nothing to do
                         pass
 
-                elif message["type"] == "reregister":
-                    # Server doesn't recognize us, re-register
-                    if self.is_processing_task:
-                        # If we're processing a task, defer re-registration until after completion
-                        logging.info(
-                            "Server requested re-registration, will do after task completion"
-                        )
-                        self.pending_reregistration = True
+                    elif message["type"] == "reregister":
+                        # Server doesn't recognize us, re-register
+                        if self.is_processing_task:
+                            # If we're processing a task, defer re-registration until after completion
+                            logging.info(
+                                "Server requested re-registration, will do after task completion"
+                            )
+                            self.pending_reregistration = True
+                        else:
+                            logging.info("Server requested re-registration")
+                            await self.register_with_server()
+
+                    elif message["type"] == "registered":
+                        # We've been registered, nothing more to do
+                        logging.info("Received registration confirmation from server")
+
                     else:
-                        logging.info("Server requested re-registration")
-                        await self.register_with_server()
+                        logging.info(f"Received message: {message['type']}")
 
-                elif message["type"] == "registered":
-                    # We've been registered, nothing more to do
-                    logging.info("Received registration confirmation from server")
+                except Exception as e:
+                    logging.error(f"Error in client loop: {e}")
+                    import traceback
 
-                else:
-                    logging.info(f"Received message: {message['type']}")
+                    traceback.print_exc()
 
-            except Exception as e:
-                logging.error(f"Error in client loop: {e}")
-                import traceback
-            traceback.print_exc()
+                    # If we were processing a task, report the error
+                    if self.current_task and self.is_processing_task:
+                        try:
+                            await self.dealer_socket.send(
+                                json.dumps(
+                                    {
+                                        "type": "error",
+                                        "task_id": self.current_task["task_id"],
+                                        "error": str(e),
+                                    }
+                                ).encode()
+                            )
 
-            # If we were processing a task, report the error
-            if self.current_task and self.is_processing_task:
-                try:
-                    await self.dealer_socket.send(
-                        json.dumps(
-                            {
-                                "type": "error",
-                                "task_id": self.current_task["task_id"],
-                                "error": str(e),
-                            }
-                        ).encode()
-                    )
+                            # Signal ready for more tasks
+                            await self.dealer_socket.send(
+                                json.dumps({"type": "ready"}).encode()
+                            )
 
-                    # Signal ready for more tasks
-                    await self.dealer_socket.send(
-                        json.dumps({"type": "ready"}).encode()
-                    )
-
-                    self.current_task = None
-                    self.is_processing_task = False
-                except:
-                    pass
+                            self.current_task = None
+                            self.is_processing_task = False
+                        except:
+                            pass
+        finally:
+            # Clean up resources
+            self.cleanup()
 
     def cleanup(self):
         """Clean up resources before exit"""
-        # Shutdown process pool
+        logging.info("Shutting down process pool...")
         if hasattr(self, "process_pool"):
-            logging.info("Shutting down process pool...")
-            self.process_pool.shutdown(wait=True)
+            self.process_pool.shutdown(wait=False)
 
         # Remove shared memory files
         for shared_memory_file in self.shared_memory_files.values():
             if shared_memory_file and os.path.exists(shared_memory_file):
                 logging.info(f"Removing shared memory file: {shared_memory_file}")
-                try:
-                    os.unlink(shared_memory_file)
-                except Exception as e:
-                    logging.error(f"Error removing shared memory file: {e}")
+            try:
+                os.unlink(shared_memory_file)
+            except Exception as e:
+                logging.error(f"Error removing shared memory file: {e}")
 
         # Remove BTC USD shared memory files
         for shared_memory_file in self.btc_usd_shared_memory_files.values():
             if shared_memory_file and os.path.exists(shared_memory_file):
-                logging.info(
-                    f"Removing BTC USD shared memory file: {shared_memory_file}"
-                )
                 try:
                     os.unlink(shared_memory_file)
                 except Exception as e:
