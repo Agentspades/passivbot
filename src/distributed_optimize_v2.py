@@ -1115,6 +1115,22 @@ class OptimizationClient(DistributedOptimizer):
             f"Starting with {self.n_workers} workers (out of {total_cpus} CPUs)"
         )
 
+        # Initialize process pool with max workers
+        # We'll adjust the actual number of workers used without recreating the pool
+        self.max_workers = multiprocessing.cpu_count()
+        self.n_workers = min(
+            self.max_workers, max(1, int(self.max_workers * 0.7 * self.aggressiveness))
+        )
+        self.active_workers = (
+            self.n_workers
+        )  # Track how many workers we're actually using
+
+        # Create process pool with max capacity
+        self.process_pool = ProcessPoolExecutor(max_workers=self.max_workers)
+
+        # Create a semaphore to limit concurrent tasks
+        self.worker_semaphore = None  # Will be initialized in setup
+
         # Create process pool for CPU-bound tasks
         self.process_pool = ProcessPoolExecutor(max_workers=self.n_workers)
 
@@ -1279,11 +1295,11 @@ class OptimizationClient(DistributedOptimizer):
         Prewarm the process pool by submitting dummy tasks.
         This creates the worker processes upfront so they're ready when real tasks arrive.
         """
-        logging.info(f"Prewarming process pool with {self.n_workers} workers...")
+        logging.info(f"Prewarming process pool with {self.max_workers} workers...")
 
         # Submit one task per worker
         futures = []
-        for i in range(self.n_workers):
+        for i in range(self.max_workers):
             futures.append(self.process_pool.submit(dummy_task, i))
 
         # Wait for all tasks to complete
@@ -1374,6 +1390,10 @@ class OptimizationClient(DistributedOptimizer):
         self.dealer_socket.connect(f"tcp://{server_host}:{server_port}")
         self.sub_socket.connect(f"tcp://{server_host}:{int(server_port)+1}")
         self.sub_socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all messages
+        self.worker_semaphore = asyncio.Semaphore(self.n_workers)
+
+        # Prewarm the process pool (only once)
+        self.prewarm_process_pool()
 
         # Give ZMQ connections time to establish
         await asyncio.sleep(1)
@@ -1387,7 +1407,6 @@ class OptimizationClient(DistributedOptimizer):
 
     async def initialize_evaluator(self):
         """Initialize the optimization evaluator"""
-        logging.info("Initializing evaluator...")
 
         # Prepare data for each exchange
         self.hlcvs_dict = {}
@@ -1592,14 +1611,12 @@ class OptimizationClient(DistributedOptimizer):
 
     async def process_task(self, task):
         """Process an optimization task with robust error handling"""
-        import concurrent.futures
-
         task_id = task["task_id"]
         individuals = task["individuals"]
         overrides_list = self.config.get("optimize", {}).get("enable_overrides", [])
 
         logging.info(f"Processing task {task_id} with {len(individuals)} individuals")
-        logging.info(f"Using {self.n_workers} worker processes")
+        logging.info(f"Using up to {self.n_workers} worker processes")
 
         # Set up progress tracking
         total_individuals = len(individuals)
@@ -1609,77 +1626,43 @@ class OptimizationClient(DistributedOptimizer):
         results = []
 
         try:
-            # Process individuals with resource management
-            futures = []
+            # Process individuals with resource management and worker limiting
+            tasks = []
 
-            # Submit all individuals to process pool
             for individual in individuals:
-                # Check if we should pause due to high resource usage
-                await self.resource_manager.wait_for_resources()
-
-                # Submit task to process pool
-                futures.append(
-                    self.process_pool.submit(
-                        evaluate_individual_wrapper,
-                        individual,
-                        overrides_list,
-                        self.config,
-                        self.shared_memory_files,
-                        self.hlcvs_shapes,
-                        self.hlcvs_dtypes,
-                        self.btc_usd_shared_memory_files,
-                        self.btc_usd_dtypes,
-                        self.msss,
+                # Create a task for each individual
+                tasks.append(
+                    self.process_individual(
+                        individual, overrides_list, self.worker_semaphore
                     )
                 )
 
-            # Process results as they complete
-            for future in futures:
-                try:
-                    # Wait for result with timeout
-                    result = await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: future.result(
-                            timeout=600
-                        ),  # 10 minute timeout per individual
+            # Wait for all individuals to be processed
+            for result in await asyncio.gather(*tasks):
+                if result:
+                    results.append(result)
+                    valid_results += 1
+
+                processed += 1
+
+                # Send progress updates periodically
+                current_time = time.time()
+                if current_time - last_progress_update > 10:  # Every 10 seconds
+                    await self.dealer_socket.send(
+                        json.dumps(
+                            {
+                                "type": "progress",
+                                "task_id": task_id,
+                                "processed": processed,
+                                "total": total_individuals,
+                                "valid_results": valid_results,
+                            }
+                        ).encode()
                     )
+                    last_progress_update = current_time
 
-                    processed += 1
-
-                    # If result is valid, add to results list
-                    if result:
-                        results.append(result)
-                        valid_results += 1
-
-                    # Send progress updates periodically
-                    current_time = time.time()
-                    if current_time - last_progress_update > 10:  # Every 10 seconds
-                        await self.dealer_socket.send(
-                            json.dumps(
-                                {
-                                    "type": "progress",
-                                    "task_id": task_id,
-                                    "processed": processed,
-                                    "total": total_individuals,
-                                    "valid_results": valid_results,
-                                }
-                            ).encode()
-                        )
-                        last_progress_update = current_time
-
-                        # Also optimize memory if needed
-                        self.optimize_memory_usage()
-
-                except concurrent.futures.TimeoutError:
-                    logging.error(f"Individual evaluation timed out after 10 minutes")
-                    processed += 1
-
-                except Exception as e:
-                    logging.error(f"Error processing individual: {e}")
-                    processed += 1
-                    import traceback
-
-                    traceback.print_exc()
+                    # Also optimize memory if needed
+                    self.optimize_memory_usage()
 
             # Send final results
             logging.info(
@@ -1712,8 +1695,51 @@ class OptimizationClient(DistributedOptimizer):
                 await self.dealer_socket.send(json.dumps({"type": "ready"}).encode())
             except:
                 # If we can't send ready message, try to reconnect
-
                 await self.reconnect_to_server()
+
+
+async def process_individual(self, individual, overrides_list, worker_semaphore):
+    """Process a single individual with resource management"""
+    try:
+        # Check if we should pause due to high resource usage
+        await self.resource_manager.wait_for_resources()
+
+        # Acquire worker semaphore to limit concurrent evaluations
+        async with worker_semaphore:
+            # Log when we start processing this individual
+            start_time = time.time()
+
+            # Run the evaluation in a separate thread to avoid blocking the event loop
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: evaluate_individual_wrapper(
+                    individual,
+                    overrides_list,
+                    self.config,
+                    self.shared_memory_files,
+                    self.hlcvs_shapes,
+                    self.hlcvs_dtypes,
+                    self.btc_usd_shared_memory_files,
+                    self.btc_usd_dtypes,
+                    self.msss,
+                ),
+            )
+
+            # Log completion time
+            end_time = time.time()
+            logging.info(
+                f"Individual processed in {end_time - start_time:.2f} seconds."
+            )
+
+            return result
+
+    except Exception as e:
+        logging.error(f"Error evaluating individual: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return None
 
     async def heartbeat_loop(self):
         """Send periodic heartbeats to server with improved error handling"""
@@ -1800,8 +1826,8 @@ class OptimizationClient(DistributedOptimizer):
                         # If reconnection fails, wait before trying again
                         await asyncio.sleep(10)
 
-        # Wait for next heartbeat
-        await asyncio.sleep(heartbeat_interval)
+            # Wait for next heartbeat
+            await asyncio.sleep(heartbeat_interval)
 
     async def register_with_server(self):
         """Register with the server"""
@@ -1912,11 +1938,9 @@ class OptimizationClient(DistributedOptimizer):
             await asyncio.sleep(1)  # Check frequently but don't busy-wait
 
     async def adaptive_worker_count(self):
-        """Dynamically adjust worker count based on system load (CPU and memory)."""
+        """Dynamically adjust worker count based on system load without recreating the process pool."""
         min_workers = 1
-        max_workers = (
-            multiprocessing.cpu_count()
-        )  # Allow using all CPUs if system is idle
+        max_workers = self.max_workers
 
         # On macOS, check if we're on battery power
         on_battery = False
@@ -2008,29 +2032,18 @@ class OptimizationClient(DistributedOptimizer):
                     decrease = max(1, int(self.n_workers * 0.1))
                     self.n_workers = max(min_workers, self.n_workers - decrease)
 
-                # If worker count changed, log it and update the process pool
+                # If worker count changed, update the semaphore
                 if self.n_workers != old_workers:
                     logging.info(
                         f"Adjusting workers: {old_workers} → {self.n_workers} "
                         + f"(CPU: {avg_cpu:.1f}%, Mem: {avg_mem:.1f}%)"
                     )
+
+                    # Create a new semaphore with the updated count
+                    # This will affect new tasks but not interrupt current ones
+                    self.worker_semaphore = asyncio.Semaphore(self.n_workers)
+
                     self.last_worker_adjustment = current_time
-
-                    # Recreate the process pool with the new worker count
-                    # This is a bit expensive but ensures we adapt to changing conditions
-                    try:
-                        old_pool = self.process_pool
-                        self.process_pool = ProcessPoolExecutor(
-                            max_workers=self.n_workers
-                        )
-
-                        # Shutdown old pool gracefully
-                        old_pool.shutdown(wait=False)
-
-                        # Prewarm the new pool
-                        self.prewarm_process_pool()
-                    except Exception as e:
-                        logging.error(f"Error recreating process pool: {e}")
 
             # Check for foreground activity (different methods per OS)
             user_active = False
@@ -2068,14 +2081,15 @@ class OptimizationClient(DistributedOptimizer):
                 except:
                     pass
 
-            # If user is active, temporarily reduce worker count
+            # If user is active, temporarily reduce worker count via semaphore
             if user_active and self.n_workers > min_workers:
                 temp_workers = max(min_workers, int(self.n_workers * 0.5))
                 if temp_workers != self.n_workers:
                     logging.info(
                         f"User activity detected - temporarily reducing workers to {temp_workers}"
                     )
-                    self.n_workers = temp_workers
+                    # Just update the semaphore, not the actual worker count
+                    self.worker_semaphore = asyncio.Semaphore(temp_workers)
 
             await asyncio.sleep(2)
 
