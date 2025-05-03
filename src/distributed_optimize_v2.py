@@ -530,7 +530,7 @@ class OptimizationServer(DistributedOptimizer):
             )
 
     async def send_tasks_to_client(self, client_id):
-        """Send optimization tasks to a client with adaptive batch sizing"""
+        """Send optimization tasks to a client with adaptive batch sizing and better error handling"""
         if not self.population:
             # No more tasks to send
             return
@@ -539,9 +539,15 @@ class OptimizationServer(DistributedOptimizer):
         if isinstance(client_id, bytes):
             client_id = client_id.decode("utf-8")
 
-        # Get client info
+        # Check if client exists
         client_info = self.clients.get(client_id)
         if not client_info:
+            logging.warning(f"Attempted to send task to unknown client {client_id}")
+            return
+
+        # Check if client is already busy
+        if client_info.get("status") == "busy":
+            logging.info(f"Client {client_id} is already busy, not sending more tasks")
             return
 
         # Determine batch size based on client resources
@@ -565,6 +571,22 @@ class OptimizationServer(DistributedOptimizer):
         task_id = str(uuid.uuid4())
         self.pending_tasks[task_id] = individuals
 
+        # Record task creation time
+        self.pending_tasks[task_id] = {
+            "individuals": individuals,
+            "created_at": time.time(),
+            "client_id": client_id,
+        }
+
+        # Initialize task progress
+        self.task_progress[task_id] = {
+            "client_id": client_id,
+            "processed": 0,
+            "total": len(individuals),
+            "valid_results": 0,
+            "last_update": time.time(),
+        }
+
         # Send task to client
         task_message = {
             "type": "task",
@@ -573,18 +595,32 @@ class OptimizationServer(DistributedOptimizer):
             "param_bounds": self.param_bounds,
         }
 
-        await self.router_socket.send_multipart(
-            [
-                client_id.encode() if isinstance(client_id, str) else client_id,
-                json.dumps(task_message).encode(),
-            ]
-        )
+        try:
+            await self.router_socket.send_multipart(
+                [
+                    client_id.encode() if isinstance(client_id, str) else client_id,
+                    json.dumps(task_message).encode(),
+                ]
+            )
 
-        # Update client status
-        self.clients[client_id]["status"] = "busy"
-        logging.info(
-            f"Sent task {task_id} with {len(individuals)} individuals to client {client_id} (workers: {client_workers})"
-        )
+            # Update client status
+            self.clients[client_id]["status"] = "busy"
+            logging.info(
+                f"Sent task {task_id} with {len(individuals)} individuals to client {client_id} (workers: {client_workers})"
+            )
+        except Exception as e:
+            logging.error(f"Error sending task to client {client_id}: {e}")
+
+            # Return individuals to population
+            self.population.extend(individuals)
+
+            # Remove from pending tasks
+            if task_id in self.pending_tasks:
+                self.pending_tasks.pop(task_id)
+
+            # Remove from task progress
+            if task_id in self.task_progress:
+                del self.task_progress[task_id]
 
     async def process_results(self, results):
         """Process optimization results from clients"""
@@ -713,104 +749,100 @@ class OptimizationServer(DistributedOptimizer):
         disconnected_clients = []
 
         for client_id, client_info in list(self.clients.items()):
-            # Only consider a client disconnected if it hasn't been seen in 20 minutes
-            # This gives plenty of time for long-running tasks
-            disconnect_threshold = 1200  # 20 minutes (increased from 10 minutes)
+            # Check if client hasn't sent a heartbeat in 10 minutes
+            if current_time - client_info["last_seen"] > 600:
+                logging.warning(
+                    f"Client {client_id} ({client_info['hostname']}) appears to be disconnected"
+                )
+                disconnected_clients.append(client_id)
 
-            if current_time - client_info["last_seen"] > disconnect_threshold:
-                # Check if client has a pending task with progress updates
-                has_recent_progress = False
-
-                for task_id in self.pending_tasks:
+                # If client had pending tasks, return them to the queue
+                tasks_to_return = []
+                for task_id, individuals in list(self.pending_tasks.items()):
                     if (
                         task_id in self.task_progress
-                        and self.task_progress[task_id].get("client_id") == client_id
+                        and self.task_progress[task_id]["client_id"] == client_id
                     ):
-                        # If there's been progress in the last 10 minutes, don't disconnect
-                        last_update = self.task_progress[task_id].get("last_update", 0)
-                        if current_time - last_update < 600:  # 10 minutes
-                            has_recent_progress = True
-                            break
+                        tasks_to_return.append((task_id, individuals))
 
-                # Only disconnect if there's no recent progress
-                if not has_recent_progress:
-                    logging.warning(
-                        f"Client {client_id} ({client_info['hostname']}) appears to be disconnected"
+                # Return tasks to queue
+                for task_id, individuals in tasks_to_return:
+                    logging.info(
+                        f"Returning task {task_id} from disconnected client {client_id} to queue"
                     )
-                    disconnected_clients.append(client_id)
+                    self.population.extend(individuals)
+                    self.pending_tasks.pop(task_id)
 
-                    # If client had pending tasks, return them to the queue
-                    for task_id, individuals in list(self.pending_tasks.items()):
-                        if (
-                            task_id in self.task_progress
-                            and self.task_progress[task_id].get("client_id")
-                            == client_id
-                        ):
-                            logging.info(f"Returning task {task_id} to queue")
-                            self.population.extend(individuals)
-                            self.pending_tasks.pop(task_id)
-
-                            # Remove from task progress
-                            if task_id in self.task_progress:
-                                del self.task_progress[task_id]
+                    # Remove from task progress
+                    if task_id in self.task_progress:
+                        del self.task_progress[task_id]
 
         # Remove disconnected clients
         for client_id in disconnected_clients:
-            if client_id in self.clients:  # Check again to avoid KeyError
+            if client_id in self.clients:
                 self.clients.pop(client_id)
 
     async def monitor_tasks(self):
         """Monitor tasks and restart any that appear stuck"""
-        # Dictionary to track when tasks were created
-        task_creation_times = {}
+        check_interval = 60  # Check every minute
 
         while True:
             current_time = time.time()
             stuck_tasks = []
 
-            # Check for stuck tasks (no progress update in 10 minutes)
+            # Check for stuck tasks
             for task_id, individuals in list(self.pending_tasks.items()):
-                # Record creation time if not already tracked
-                if task_id not in task_creation_times:
-                    task_creation_times[task_id] = current_time
-
                 # Get task progress if available
                 task_progress = self.task_progress.get(task_id)
 
-                # Check if task is stuck
                 if task_progress:
                     last_update = task_progress.get("last_update", 0)
+                    client_id = task_progress.get("client_id")
+
+                    # Check if task is stuck (no progress update in 10 minutes)
                     if current_time - last_update > 600:  # 10 minutes
-                        stuck_tasks.append((task_id, individuals))
+                        logging.warning(
+                            f"Task {task_id} from client {client_id} appears to be stuck - no updates for {(current_time - last_update) / 60:.1f} minutes"
+                        )
+                        stuck_tasks.append((task_id, individuals, client_id))
                 else:
                     # No progress info - check if task is old (created more than 15 minutes ago)
                     # This is a fallback for tasks that never reported progress
-                    creation_time = task_creation_times.get(task_id, current_time)
-                    if current_time - creation_time > 900:  # 15 minutes
-                        stuck_tasks.append((task_id, individuals))
+                    task_created = self.pending_tasks.get(task_id, {}).get(
+                        "created_at", current_time
+                    )
+                    if current_time - task_created > 900:  # 15 minutes
+                        logging.warning(
+                            f"Task {task_id} appears to be stuck - no progress reports received"
+                        )
+                        stuck_tasks.append((task_id, individuals, None))
 
-            # Restart stuck tasks
-            for task_id, individuals in stuck_tasks:
-                logging.warning(
-                    f"Task {task_id} appears to be stuck - returning to queue"
-                )
-                self.pending_tasks.pop(task_id)
+            # Handle stuck tasks
+            for task_id, individuals, client_id in stuck_tasks:
+                logging.warning(f"Returning stuck task {task_id} to queue")
+
+                # Return individuals to population
                 self.population.extend(individuals)
+
+                # Remove from pending tasks
+                if task_id in self.pending_tasks:
+                    self.pending_tasks.pop(task_id)
 
                 # Remove from task progress
                 if task_id in self.task_progress:
                     del self.task_progress[task_id]
 
-                # Remove from creation times tracking
-                if task_id in task_creation_times:
-                    del task_creation_times[task_id]
+                # Mark client as disconnected if we haven't heard from it in a while
+                if client_id and client_id in self.clients:
+                    client_last_seen = self.clients[client_id].get("last_seen", 0)
+                    if current_time - client_last_seen > 300:  # 5 minutes
+                        logging.warning(
+                            f"Marking client {client_id} as disconnected due to stuck task"
+                        )
+                        self.clients.pop(client_id)
 
-            # Clean up task_creation_times for completed tasks
-            for task_id in list(task_creation_times.keys()):
-                if task_id not in self.pending_tasks:
-                    del task_creation_times[task_id]
-
-            await asyncio.sleep(60)  # Check every minute
+            # Wait for next check
+            await asyncio.sleep(check_interval)
 
     async def broadcast_status(self):
         """Broadcast system status to all clients"""
@@ -1294,6 +1326,44 @@ class OptimizationClient(DistributedOptimizer):
 
         return False
 
+    async def reconnect_to_server(self):
+        """Reconnect to server after a disconnection"""
+        logging.info("Attempting to reconnect to server...")
+
+        # Close existing sockets
+        self.dealer_socket.close()
+        self.sub_socket.close()
+
+        # Create new sockets
+        self.dealer_socket = self.context.socket(zmq.DEALER)
+        self.sub_socket = self.context.socket(zmq.SUB)
+
+        # Set client ID in socket
+        self.dealer_socket.setsockopt(zmq.IDENTITY, self.node_id.encode())
+
+        # Set socket options for more reliable connections
+        self.dealer_socket.setsockopt(
+            zmq.RECONNECT_IVL, 1000
+        )  # Reconnect after 1 second
+        self.dealer_socket.setsockopt(
+            zmq.RECONNECT_IVL_MAX, 10000
+        )  # Max 10 seconds between reconnects
+        self.dealer_socket.setsockopt(
+            zmq.LINGER, 0
+        )  # Don't wait for unsent messages when closing
+
+        # Connect to server
+        server_host, server_port = self.server_address.split(":")
+        self.dealer_socket.connect(f"tcp://{server_host}:{server_port}")
+        self.sub_socket.connect(f"tcp://{server_host}:{int(server_port)+1}")
+        self.sub_socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all messages
+
+        # Give ZMQ connections time to establish
+        await asyncio.sleep(2)
+
+        # Register with server
+        return await self.register_with_server()
+
     async def setup(self):
         """Connect to server and register"""
         # Set client ID in socket
@@ -1521,7 +1591,9 @@ class OptimizationClient(DistributedOptimizer):
         logging.info("Data preparation complete")
 
     async def process_task(self, task):
-        """Process an optimization task using process pool"""
+        """Process an optimization task with robust error handling"""
+        import concurrent.futures
+
         task_id = task["task_id"]
         individuals = task["individuals"]
         overrides_list = self.config.get("optimize", {}).get("enable_overrides", [])
@@ -1529,132 +1601,125 @@ class OptimizationClient(DistributedOptimizer):
         logging.info(f"Processing task {task_id} with {len(individuals)} individuals")
         logging.info(f"Using {self.n_workers} worker processes")
 
-        results = []
-        valid_results = 0
+        # Set up progress tracking
         total_individuals = len(individuals)
         processed = 0
+        valid_results = 0
+        last_progress_update = time.time()
+        results = []
 
-        # Process individuals with resource management
-        futures = []
+        try:
+            # Process individuals with resource management
+            futures = []
 
-        # Submit all individuals to the process pool
-        for individual in individuals:
-            # Check if we should pause due to high resource usage
-            await self.resource_manager.wait_for_resources()
+            # Submit all individuals to process pool
+            for individual in individuals:
+                # Check if we should pause due to high resource usage
+                await self.resource_manager.wait_for_resources()
 
-            # Submit the task to the process pool
-            future = self.process_pool.submit(
-                evaluate_individual_wrapper,
-                individual,
-                overrides_list,
-                self.config,
-                self.shared_memory_files,
-                self.hlcvs_shapes,
-                self.hlcvs_dtypes,
-                self.btc_usd_shared_memory_files,
-                self.btc_usd_dtypes,
-                self.msss,
+                # Submit task to process pool
+                futures.append(
+                    self.process_pool.submit(
+                        evaluate_individual_wrapper,
+                        individual,
+                        overrides_list,
+                        self.config,
+                        self.shared_memory_files,
+                        self.hlcvs_shapes,
+                        self.hlcvs_dtypes,
+                        self.btc_usd_shared_memory_files,
+                        self.btc_usd_dtypes,
+                        self.msss,
+                    )
+                )
+
+            # Process results as they complete
+            for future in futures:
+                try:
+                    # Wait for result with timeout
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: future.result(
+                            timeout=600
+                        ),  # 10 minute timeout per individual
+                    )
+
+                    processed += 1
+
+                    # If result is valid, add to results list
+                    if result:
+                        results.append(result)
+                        valid_results += 1
+
+                    # Send progress updates periodically
+                    current_time = time.time()
+                    if current_time - last_progress_update > 10:  # Every 10 seconds
+                        await self.dealer_socket.send(
+                            json.dumps(
+                                {
+                                    "type": "progress",
+                                    "task_id": task_id,
+                                    "processed": processed,
+                                    "total": total_individuals,
+                                    "valid_results": valid_results,
+                                }
+                            ).encode()
+                        )
+                        last_progress_update = current_time
+
+                        # Also optimize memory if needed
+                        self.optimize_memory_usage()
+
+                except concurrent.futures.TimeoutError:
+                    logging.error(f"Individual evaluation timed out after 10 minutes")
+                    processed += 1
+
+                except Exception as e:
+                    logging.error(f"Error processing individual: {e}")
+                    processed += 1
+                    import traceback
+
+                    traceback.print_exc()
+
+            # Send final results
+            logging.info(
+                f"Task {task_id} completed: {valid_results}/{total_individuals} valid results"
             )
-            futures.append(future)
-
-        # Process results as they complete
-        start_time = time.time()
-        last_progress_time = start_time
-
-        # Check if we should continue processing or if the task was cancelled
-        task_cancelled = False
-
-        for future in futures:
-            try:
-                # Check if we've received a re-registration request (indicating task cancellation)
-                if self.pending_reregistration:
-                    logging.warning(
-                        f"Task {task_id} appears to have been cancelled by the server"
-                    )
-                    task_cancelled = True
-                    # Cancel remaining futures if possible
-                    for f in futures:
-                        if not f.done():
-                            f.cancel()
-                    break
-
-                # Wait for the future to complete
-                result = future.result()
-
-                if result:
-                    results.append(result)
-                    valid_results += 1
-
-                # Update progress
-                processed += 1
-                current_time = time.time()
-
-                # Send progress update every 5 seconds or every 10% of individuals
-                if (
-                    current_time - last_progress_time > 5
-                    or processed % max(1, total_individuals // 10) == 0
-                ):
-                    await self.dealer_socket.send(
-                        json.dumps(
-                            {
-                                "type": "progress",
-                                "task_id": task_id,
-                                "processed": processed,
-                                "total": total_individuals,
-                                "valid_results": valid_results,
-                            }
-                        ).encode()
-                    )
-                    last_progress_time = current_time
-
-                # Periodically optimize memory if enabled
-                if processed % 10 == 0:
-                    self.optimize_memory_usage()
-
-            except Exception as e:
-                logging.error(f"Error processing individual: {e}")
-                processed += 1  # Still count as processed even if it failed
-
-        end_time = time.time()
-        processing_time = end_time - start_time
-
-        logging.info(
-            f"Processed {processed}/{total_individuals} individuals in {processing_time:.2f} seconds"
-        )
-        logging.info(
-            f"Average time per individual: {processing_time/total_individuals:.2f} seconds"
-        )
-        logging.info(f"Valid results: {valid_results}/{total_individuals}")
-
-        # Send final progress update
-        await self.dealer_socket.send(
-            json.dumps(
-                {
-                    "type": "progress",
-                    "task_id": task_id,
-                    "processed": processed,
-                    "total": total_individuals,
-                    "valid_results": valid_results,
-                }
-            ).encode()
-        )
-
-        # Only send results if the task wasn't cancelled
-        if not task_cancelled and results:
-            # Send results back to server
             await self.dealer_socket.send(
                 json.dumps(
                     {"type": "result", "task_id": task_id, "results": results}
                 ).encode()
             )
 
-        # Signal ready for more tasks immediately
-        await self.dealer_socket.send(json.dumps({"type": "ready"}).encode())
+            # Signal ready for more tasks
+            await self.dealer_socket.send(json.dumps({"type": "ready"}).encode())
 
-        logging.info(f"Completed task {task_id} with {len(results)} valid results")
+        except Exception as e:
+            logging.error(f"Error processing task {task_id}: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+            # Report error to server
+            await self.dealer_socket.send(
+                json.dumps(
+                    {"type": "error", "task_id": task_id, "error": str(e)}
+                ).encode()
+            )
+
+            # Try to signal ready for more tasks
+            try:
+                await self.dealer_socket.send(json.dumps({"type": "ready"}).encode())
+            except:
+                # If we can't send ready message, try to reconnect
+
+                await self.reconnect_to_server()
 
     async def heartbeat_loop(self):
-        """Send periodic heartbeats to server"""
+        """Send periodic heartbeats to server with improved error handling"""
+        heartbeat_interval = 15  # Send heartbeat every 15 seconds
+        missed_heartbeats = 0
+
         while True:
             try:
                 # Get current resource usage
@@ -1668,34 +1733,75 @@ class OptimizationClient(DistributedOptimizer):
                     "paused": self.resource_manager.paused,
                 }
 
+                # Send heartbeat
                 await self.dealer_socket.send(
                     json.dumps(
                         {"type": "heartbeat", "resources": resource_info}
                     ).encode()
                 )
 
-                # Wait for acknowledgment with a timeout
+                # Wait for acknowledgment with timeout
                 try:
-                    # Set a timeout for receiving the acknowledgment
                     response = await asyncio.wait_for(
-                        self.dealer_socket.recv(), timeout=5.0
+                        self.dealer_socket.recv(), timeout=10.0
                     )
-                    message = json.loads(response.decode())
+                    response = json.loads(response.decode())
 
-                    # If server requests re-registration, do it
-                    if message.get("type") == "reregister":
-                        logging.info("Server requested re-registration")
+                    if response["type"] == "ack":
+                        # Heartbeat acknowledged
+                        missed_heartbeats = 0
+                    elif response["type"] == "reregister":
+                        # Server wants us to re-register
+                        logging.info(
+                            "Server requested re-registration during heartbeat"
+                        )
                         await self.register_with_server()
+                        missed_heartbeats = 0
+                    elif response["type"] == "task":
+                        # We got a task instead of an ack - handle it
+                        logging.info("Received task during heartbeat")
+                        self.current_task = response
+                        self.is_processing_task = True
+                        # Process the task in a separate task to not block heartbeats
+                        asyncio.create_task(self.process_task(response))
+                        missed_heartbeats = 0
+                    else:
+                        # Unexpected response
+                        logging.warning(
+                            f"Unexpected response to heartbeat: {response['type']}"
+                        )
                 except asyncio.TimeoutError:
+                    # No acknowledgment received
+                    missed_heartbeats += 1
                     logging.warning(
-                        "No heartbeat acknowledgment received from server, will retry"
+                        f"No heartbeat acknowledgment received (missed: {missed_heartbeats})"
                     )
 
+                    if missed_heartbeats >= 3:
+                        # Try to reconnect after 3 consecutive missed heartbeats
+                        logging.error(
+                            "Connection appears to be lost, attempting to reconnect"
+                        )
+                        if await self.reconnect_to_server():
+                            missed_heartbeats = 0
+                        else:
+                            # If reconnection fails, wait before trying again
+                            await asyncio.sleep(10)
             except Exception as e:
-                logging.error(f"Error sending heartbeat: {e}")
+                logging.error(f"Error in heartbeat loop: {e}")
+                missed_heartbeats += 1
 
-            # Send heartbeat every 15 seconds
-            await asyncio.sleep(15)  # Send heartbeat every 15 seconds
+                if missed_heartbeats >= 3:
+                    # Try to reconnect after 3 consecutive errors
+                    logging.error("Too many heartbeat errors, attempting to reconnect")
+                    if await self.reconnect_to_server():
+                        missed_heartbeats = 0
+                    else:
+                        # If reconnection fails, wait before trying again
+                        await asyncio.sleep(10)
+
+        # Wait for next heartbeat
+        await asyncio.sleep(heartbeat_interval)
 
     async def register_with_server(self):
         """Register with the server"""
@@ -1974,7 +2080,7 @@ class OptimizationClient(DistributedOptimizer):
             await asyncio.sleep(2)
 
     async def run(self):
-        """Main client loop"""
+        """Main client loop with robust error handling"""
         # Set up process pool
         self.process_pool = ProcessPoolExecutor(max_workers=self.n_workers)
 
@@ -1984,12 +2090,25 @@ class OptimizationClient(DistributedOptimizer):
         # Connect to server
         server_host, server_port = self.server_address.split(":")
         self.dealer_socket.setsockopt(zmq.IDENTITY, self.node_id.encode())
+
+        # Set socket options for more reliable connections
+        self.dealer_socket.setsockopt(
+            zmq.RECONNECT_IVL, 1000
+        )  # Reconnect after 1 second
+        self.dealer_socket.setsockopt(
+            zmq.RECONNECT_IVL_MAX, 10000
+        )  # Max 10 seconds between reconnects
+        self.dealer_socket.setsockopt(
+            zmq.LINGER, 0
+        )  # Don't wait for unsent messages when closing
+        self.dealer_socket.setsockopt(zmq.RCVTIMEO, 60000)  # 60 second receive timeout
+
         self.dealer_socket.connect(f"tcp://{server_host}:{server_port}")
         self.sub_socket.connect(f"tcp://{server_host}:{int(server_port)+1}")
         self.sub_socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all messages
 
         # Give ZMQ connections time to establish
-        await asyncio.sleep(1)
+        await asyncio.sleep(5)
 
         # Register with server
         registration_success = await self.register_with_server()
@@ -2006,16 +2125,19 @@ class OptimizationClient(DistributedOptimizer):
         # Track if we're currently processing a task
         self.is_processing_task = False
 
-        # Track if we need to re-register after task completion
-        self.pending_reregistration = False
-
         try:
             # Main message handling loop
+            connection_failures = 0
             while True:
                 try:
-                    # Receive message from server
-                    message = await self.dealer_socket.recv()
+                    # Receive message from server with timeout
+                    message = await asyncio.wait_for(
+                        self.dealer_socket.recv(), timeout=120  # 2 minute timeout
+                    )
                     message = json.loads(message.decode())
+
+                    # Reset connection failure counter on successful message
+                    connection_failures = 0
 
                     if message["type"] == "task":
                         # Process optimization task
@@ -2023,12 +2145,7 @@ class OptimizationClient(DistributedOptimizer):
                         self.is_processing_task = True
                         await self.process_task(message)
                         self.is_processing_task = False
-
-                        # If we received re-registration requests during task processing,
-                        # handle them now
-                        if self.pending_reregistration:
-                            self.pending_reregistration = False
-                            await self.register_with_server()
+                        self.current_task = None
 
                     elif message["type"] == "ack":
                         # Heartbeat acknowledgment, nothing to do
@@ -2036,51 +2153,90 @@ class OptimizationClient(DistributedOptimizer):
 
                     elif message["type"] == "reregister":
                         # Server doesn't recognize us, re-register
-                        if self.is_processing_task:
-                            # If we're processing a task, defer re-registration until after completion
-                            logging.info(
-                                "Server requested re-registration, will do after task completion"
-                            )
-                            self.pending_reregistration = True
-                        else:
-                            logging.info("Server requested re-registration")
-                            await self.register_with_server()
-
-                    elif message["type"] == "registered":
-                        # We've been registered, nothing more to do
-                        logging.info("Received registration confirmation from server")
+                        logging.info("Server requested re-registration")
+                        await self.register_with_server()
 
                     else:
                         logging.info(f"Received message: {message['type']}")
 
-                except Exception as e:
-                    logging.error(f"Error in client loop: {e}")
-                    import traceback
+                except asyncio.TimeoutError:
+                    # No message received within timeout period
+                    connection_failures += 1
+                    logging.warning(
+                        f"No message received from server for 2 minutes (failures: {connection_failures})"
+                    )
 
-                    traceback.print_exc()
+                    if connection_failures >= 3:
+                        # Try to reconnect after 3 consecutive failures
+                        logging.error(
+                            "Connection appears to be lost, attempting to reconnect"
+                        )
+                        if await self.reconnect_to_server():
+                            connection_failures = 0
+                        else:
+                            # If reconnection fails, wait before trying again
+                            await asyncio.sleep(10)
 
-                    # If we were processing a task, report the error
-                    if self.current_task and self.is_processing_task:
-                        try:
-                            await self.dealer_socket.send(
-                                json.dumps(
-                                    {
-                                        "type": "error",
-                                        "task_id": self.current_task["task_id"],
-                                        "error": str(e),
-                                    }
-                                ).encode()
-                            )
+        except zmq.ZMQError as e:
+            # Handle ZMQ-specific errors
+            logging.error(f"ZMQ error: {e}")
 
-                            # Signal ready for more tasks
-                            await self.dealer_socket.send(
-                                json.dumps({"type": "ready"}).encode()
-                            )
+            if e.errno == zmq.EAGAIN:
+                # Resource temporarily unavailable (timeout)
+                connection_failures += 1
+                logging.warning(f"ZMQ timeout (failures: {connection_failures})")
 
-                            self.current_task = None
-                            self.is_processing_task = False
-                        except:
-                            pass
+                if connection_failures >= 3:
+                    # Try to reconnect after 3 consecutive failures
+                    logging.error(
+                        "Connection appears to be lost, attempting to reconnect"
+                    )
+                    if await self.reconnect_to_server():
+                        connection_failures = 0
+                    else:
+                        # If reconnection fails, wait before trying again
+                        await asyncio.sleep(10)
+            else:
+                # Other ZMQ errors - try to reconnect
+                logging.error("Attempting to reconnect due to ZMQ error")
+                if await self.reconnect_to_server():
+                    connection_failures = 0
+                else:
+                    # If reconnection fails, wait before trying again
+                    await asyncio.sleep(10)
+
+        except Exception as e:
+            logging.error(f"Error in client loop: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+            # If we were processing a task, report the error
+            if self.current_task and self.is_processing_task:
+                try:
+                    await self.dealer_socket.send(
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "task_id": self.current_task["task_id"],
+                                "error": str(e),
+                            }
+                        ).encode()
+                    )
+
+                    # Signal ready for more tasks
+                    await self.dealer_socket.send(
+                        json.dumps({"type": "ready"}).encode()
+                    )
+
+                    self.current_task = None
+                    self.is_processing_task = False
+                except:
+                    pass
+
+            # Wait a bit before continuing
+            await asyncio.sleep(5)
+
         finally:
             # Clean up resources
             self.cleanup()
@@ -2110,13 +2266,13 @@ class OptimizationClient(DistributedOptimizer):
 
 
 async def main():
-    """Main entry point"""
+    """Main entry point with improved error handling"""
     # Ensure Rust code is compiled
     manage_rust_compilation()
 
     # Parse command line arguments
     parser = argparse.ArgumentParser(
-        description="Distributed optimization for Passivbot with improved CPU utilization"
+        description="Distributed optimization for Passivbot"
     )
     parser.add_argument(
         "--mode",
@@ -2136,7 +2292,7 @@ async def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=25,  # Increased from 10 to 25
+        default=10,
         help="Number of individuals to send in each task (server mode only)",
     )
 
@@ -2149,13 +2305,13 @@ async def main():
     parser.add_argument(
         "--max-cpu",
         type=int,
-        default=85,  # Increased from 70 to 85
+        default=70,
         help="Maximum CPU usage percentage (client mode only)",
     )
     parser.add_argument(
         "--max-memory",
         type=int,
-        default=85,  # Increased from 80 to 85
+        default=80,
         help="Maximum memory usage percentage (client mode only)",
     )
     parser.add_argument(
@@ -2173,19 +2329,20 @@ async def main():
     parser.add_argument(
         "--priority",
         type=str,
+        default="low",
         choices=["low", "normal", "high"],
-        default="normal",
         help="Process priority (client mode only)",
     )
     parser.add_argument(
         "--optimize-memory",
         action="store_true",
-        help="Periodically optimize memory usage (client mode only)",
+        help="Enable aggressive memory optimization (client mode only)",
     )
 
     args = parser.parse_args()
 
     # Create and run the appropriate component
+    client = None
     try:
         if args.mode == "server":
             if not args.config:
@@ -2208,7 +2365,7 @@ async def main():
         traceback.print_exc()
     finally:
         # Clean up resources
-        if args.mode == "client" and "client" in locals():
+        if args.mode == "client" and client is not None:
             client.cleanup()
 
         logging.info("Exiting...")
