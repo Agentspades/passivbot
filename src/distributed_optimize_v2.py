@@ -448,7 +448,6 @@ class OptimizationServer(DistributedOptimizer):
                     self.clients[client_id]["status"] = "idle"
 
                 # Send more tasks
-
                 await self.send_tasks_to_client(client_id)
 
     async def handle_progress_update(self, client_id, message):
@@ -674,7 +673,7 @@ class OptimizationServer(DistributedOptimizer):
             self.clients.items()
         ):  # Use list() to avoid modification during iteration
             # Check if client hasn't sent a heartbeat in 10 minutes (increased from 60 seconds)
-            if current_time - client_info["last_seen"] > 600:
+            if current_time - client_info["last_seen"] > 600:  # 10 minutes
                 logging.warning(
                     f"Client {client_id} ({client_info['hostname']}) appears to be disconnected"
                 )
@@ -699,14 +698,22 @@ class OptimizationServer(DistributedOptimizer):
             if client_id in self.clients:  # Check again to avoid KeyError
                 self.clients.pop(client_id)
 
+
     async def monitor_tasks(self):
         """Monitor tasks and restart any that appear stuck"""
+        # Dictionary to track when tasks were created
+        task_creation_times = {}
+
         while True:
             current_time = time.time()
             stuck_tasks = []
 
-            # Check for stuck tasks (no progress update in 10 minutes)
-            for task_id, individuals in list(self.pending_tasks.items()):
+                # Check for stuck tasks (no progress update in 10 minutes)
+                for task_id, individuals in list(self.pending_tasks.items()):
+                # Record creation time if not already tracked
+                if task_id not in task_creation_times:
+                    task_creation_times[task_id] = current_time
+
                 # Get task progress if available
                 task_progress = self.task_progress.get(task_id)
 
@@ -718,27 +725,28 @@ class OptimizationServer(DistributedOptimizer):
                 else:
                     # No progress info - check if task is old (created more than 15 minutes ago)
                     # This is a fallback for tasks that never reported progress
-                    if (
-                        task_id in self.pending_tasks
-                        and current_time
-                        - self.pending_tasks.get(task_id, {}).get(
-                            "created_at", current_time
-                        )
-                        > 900
-                    ):
+                    creation_time = task_creation_times.get(task_id, current_time)
+                    if current_time - creation_time > 900:  # 15 minutes
                         stuck_tasks.append((task_id, individuals))
 
             # Restart stuck tasks
             for task_id, individuals in stuck_tasks:
-                logging.warning(
-                    f"Task {task_id} appears to be stuck - returning to queue"
-                )
+                logging.warning(f"Task {task_id} appears to be stuck - returning to queue")
                 self.pending_tasks.pop(task_id)
                 self.population.extend(individuals)
 
                 # Remove from task progress
                 if task_id in self.task_progress:
                     del self.task_progress[task_id]
+
+                # Remove from creation times tracking
+                if task_id in task_creation_times:
+                    del task_creation_times[task_id]
+
+            # Clean up task_creation_times for completed tasks
+            for task_id in list(task_creation_times.keys()):
+                if task_id not in self.pending_tasks:
+                    del task_creation_times[task_id]
 
             await asyncio.sleep(60)  # Check every minute
 
