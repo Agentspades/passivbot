@@ -352,27 +352,7 @@ class OptimizationServer(DistributedOptimizer):
 
         msg_type = message.get("type")
 
-        # If client was previously marked as disconnected but is now sending messages,
-        # re-register it automatically (but only once)
-        if not hasattr(self, "reregister_requests"):
-            self.reregister_requests = {}
-
-        # Only send re-registration request if we haven't sent one recently
-        current_time = time.time()
-        if (
-            client_id not in self.reregister_requests
-            or current_time - self.reregister_requests[client_id] > 30
-        ):
-            logging.info(f"Client {client_id} reconnected, requesting re-registration")
-            await self.router_socket.send_multipart(
-                [
-                    client_id.encode() if isinstance(client_id, str) else client_id,
-                    json.dumps({"type": "reregister"}).encode(),
-                ]
-            )
-            self.reregister_requests[client_id] = current_time
-            return
-
+        # Special handling for registration messages
         if msg_type == "register":
             # New client registration
             hostname = message.get("hostname", "unknown")
@@ -398,8 +378,35 @@ class OptimizationServer(DistributedOptimizer):
                 and client_id in self.reregister_requests
             ):
                 del self.reregister_requests[client_id]
+            return
 
-        elif msg_type == "heartbeat":
+        # If client was previously marked as disconnected but is now sending messages,
+        # re-register it automatically (but only once)
+        if client_id not in self.clients:
+            # Use a class variable to track clients we've asked to re-register
+            if not hasattr(self, "reregister_requests"):
+                self.reregister_requests = {}
+
+            # Only send re-registration request if we haven't sent one recently
+            current_time = time.time()
+            if (
+                client_id not in self.reregister_requests
+                or current_time - self.reregister_requests[client_id] > 30
+            ):
+                logging.info(
+                    f"Client {client_id} reconnected, requesting re-registration"
+                )
+                await self.router_socket.send_multipart(
+                    [
+                        client_id.encode() if isinstance(client_id, str) else client_id,
+                        json.dumps({"type": "reregister"}).encode(),
+                    ]
+                )
+                self.reregister_requests[client_id] = current_time
+            return
+
+        # Handle other message types
+        if msg_type == "heartbeat":
             # Update client's last seen timestamp
             if client_id in self.clients:
                 self.clients[client_id]["last_seen"] = time.time()
@@ -1278,10 +1285,14 @@ class OptimizationClient(DistributedOptimizer):
         self.sub_socket.connect(f"tcp://{server_host}:{int(server_port)+1}")
         self.sub_socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all messages
 
+        # Give ZMQ connections time to establish
+        await asyncio.sleep(1)
+
         # Register with server
         success = await self.register_with_server()
 
         if not success:
+            logging.error("Failed to register with server, exiting")
             sys.exit(1)
 
     async def initialize_evaluator(self):
@@ -1668,43 +1679,69 @@ class OptimizationClient(DistributedOptimizer):
 
     async def register_with_server(self):
         """Register with the server"""
-        resource_info = {
-            "cpu_count": multiprocessing.cpu_count(),
-            "workers": self.n_workers,
-            "max_cpu_percent": self.max_cpu_percent,
-            "max_memory_percent": self.max_memory_percent,
-            "total_memory": psutil.virtual_memory().total,
-        }
-
-        await self.dealer_socket.send(
-            json.dumps(
-                {
-                    "type": "register",
-                    "hostname": self.hostname,
-                    "resources": resource_info,
+        # Try registration up to 3 times
+        for attempt in range(3):
+            try:
+                resource_info = {
+                    "cpu_count": multiprocessing.cpu_count(),
+                    "workers": self.n_workers,
+                    "max_cpu_percent": self.max_cpu_percent,
+                    "max_memory_percent": self.max_memory_percent,
+                    "total_memory": psutil.virtual_memory().total,
                 }
-            ).encode()
-        )
 
-        # Wait for registration confirmation
-        message = await self.dealer_socket.recv()
-        message = json.loads(message.decode())
+                await self.dealer_socket.send(
+                    json.dumps(
+                        {
+                            "type": "register",
+                            "hostname": self.hostname,
+                            "resources": resource_info,
+                        }
+                    ).encode()
+                )
 
-        if message["type"] == "registered":
-            logging.info(f"Successfully registered with server")
-            # Only update config if it's provided and we don't already have one
-            if "config" in message and self.config is None:
-                self.config = message["config"]
-                # Initialize evaluator if needed
-                if self.evaluator is None:
-                    await self.initialize_evaluator()
+                # Wait for registration confirmation with timeout
+                try:
+                    message = await asyncio.wait_for(
+                        self.dealer_socket.recv(), timeout=10.0
+                    )
+                    message = json.loads(message.decode())
 
-            # Signal ready for tasks
-            await self.dealer_socket.send(json.dumps({"type": "ready"}).encode())
-            return True
-        else:
-            logging.error(f"Failed to register with server: {message}")
-            return False
+                    if message["type"] == "registered":
+                        logging.info(f"Successfully registered with server")
+                        # Only update config if it's provided and we don't already have one
+                        if "config" in message and self.config is None:
+                            self.config = message["config"]
+                            # Initialize evaluator if needed
+                            if self.evaluator is None:
+                                await self.initialize_evaluator()
+
+                        # Signal ready for tasks
+                        await self.dealer_socket.send(
+                            json.dumps({"type": "ready"}).encode()
+                        )
+                        return True
+                    elif message["type"] == "reregister":
+                        # Server wants us to register again, which we're already doing
+                        logging.info(
+                            "Server requested re-registration during registration, retrying..."
+                        )
+                        await asyncio.sleep(1)  # Wait a bit before retrying
+                        continue
+                    else:
+                        logging.error(
+                            f"Unexpected response during registration: {message}"
+                        )
+                        return False
+                except asyncio.TimeoutError:
+                    logging.error("Registration timed out, retrying...")
+                    continue
+            except Exception as e:
+                logging.error(f"Error during registration: {e}")
+                return False
+
+        logging.error("Failed to register after multiple attempts")
+        return False
 
     async def status_listener(self):
         """Listen for status broadcasts from server"""
