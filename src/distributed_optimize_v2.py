@@ -1697,49 +1697,48 @@ class OptimizationClient(DistributedOptimizer):
                 # If we can't send ready message, try to reconnect
                 await self.reconnect_to_server()
 
+    async def process_individual(self, individual, overrides_list, worker_semaphore):
+        """Process a single individual with resource management"""
+        try:
+            # Check if we should pause due to high resource usage
+            await self.resource_manager.wait_for_resources()
 
-async def process_individual(self, individual, overrides_list, worker_semaphore):
-    """Process a single individual with resource management"""
-    try:
-        # Check if we should pause due to high resource usage
-        await self.resource_manager.wait_for_resources()
+            # Acquire worker semaphore to limit concurrent evaluations
+            async with worker_semaphore:
+                # Log when we start processing this individual
+                start_time = time.time()
 
-        # Acquire worker semaphore to limit concurrent evaluations
-        async with worker_semaphore:
-            # Log when we start processing this individual
-            start_time = time.time()
+                # Run the evaluation in a separate thread to avoid blocking the event loop
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: evaluate_individual_wrapper(
+                        individual,
+                        overrides_list,
+                        self.config,
+                        self.shared_memory_files,
+                        self.hlcvs_shapes,
+                        self.hlcvs_dtypes,
+                        self.btc_usd_shared_memory_files,
+                        self.btc_usd_dtypes,
+                        self.msss,
+                    ),
+                )
 
-            # Run the evaluation in a separate thread to avoid blocking the event loop
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: evaluate_individual_wrapper(
-                    individual,
-                    overrides_list,
-                    self.config,
-                    self.shared_memory_files,
-                    self.hlcvs_shapes,
-                    self.hlcvs_dtypes,
-                    self.btc_usd_shared_memory_files,
-                    self.btc_usd_dtypes,
-                    self.msss,
-                ),
-            )
+                # Log completion time
+                end_time = time.time()
+                logging.info(
+                    f"Individual processed in {end_time - start_time:.2f} seconds."
+                )
 
-            # Log completion time
-            end_time = time.time()
-            logging.info(
-                f"Individual processed in {end_time - start_time:.2f} seconds."
-            )
+                return result
 
-            return result
+        except Exception as e:
+            logging.error(f"Error evaluating individual: {e}")
+            import traceback
 
-    except Exception as e:
-        logging.error(f"Error evaluating individual: {e}")
-        import traceback
-
-        traceback.print_exc()
-        return None
+            traceback.print_exc()
+            return None
 
     async def heartbeat_loop(self):
         """Send periodic heartbeats to server with improved error handling"""
