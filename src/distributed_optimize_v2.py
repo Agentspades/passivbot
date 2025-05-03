@@ -353,8 +353,16 @@ class OptimizationServer(DistributedOptimizer):
         msg_type = message.get("type")
 
         # If client was previously marked as disconnected but is now sending messages,
-        # re-register it automatically
-        if client_id not in self.clients and msg_type != "register":
+        # re-register it automatically (but only once)
+        if not hasattr(self, "reregister_requests"):
+            self.reregister_requests = {}
+
+        # Only send re-registration request if we haven't sent one recently
+        current_time = time.time()
+        if (
+            client_id not in self.reregister_requests
+            or current_time - self.reregister_requests[client_id] > 30
+        ):
             logging.info(f"Client {client_id} reconnected, requesting re-registration")
             await self.router_socket.send_multipart(
                 [
@@ -362,6 +370,7 @@ class OptimizationServer(DistributedOptimizer):
                     json.dumps({"type": "reregister"}).encode(),
                 ]
             )
+            self.reregister_requests[client_id] = current_time
             return
 
         if msg_type == "register":
@@ -375,13 +384,20 @@ class OptimizationServer(DistributedOptimizer):
                 "status": "idle",
                 "tasks_completed": 0,
             }
-            logging.info(f"New client registered: {hostname} ({client_id})")
-            await self.router_socket.send_multipart(
-                [
-                    client_id.encode() if isinstance(client_id, str) else client_id,
-                    json.dumps({"type": "registered", "config": self.config}).encode(),
-                ]
-            )
+        logging.info(f"New client registered: {hostname} ({client_id})")
+        await self.router_socket.send_multipart(
+            [
+                client_id.encode() if isinstance(client_id, str) else client_id,
+                json.dumps({"type": "registered", "config": self.config}).encode(),
+            ]
+        )
+
+        # Clear any re-registration requests for this client
+        if (
+            hasattr(self, "reregister_requests")
+            and client_id in self.reregister_requests
+        ):
+            del self.reregister_requests[client_id]
 
         elif msg_type == "heartbeat":
             # Update client's last seen timestamp
@@ -669,29 +685,47 @@ class OptimizationServer(DistributedOptimizer):
         current_time = time.time()
         disconnected_clients = []
 
-        for client_id, client_info in list(
-            self.clients.items()
-        ):  # Use list() to avoid modification during iteration
-            # Check if client hasn't sent a heartbeat in 10 minutes (increased from 60 seconds)
-            if current_time - client_info["last_seen"] > 600:  # 10 minutes
-                logging.warning(
-                    f"Client {client_id} ({client_info['hostname']}) appears to be disconnected"
-                )
-                disconnected_clients.append(client_id)
+        for client_id, client_info in list(self.clients.items()):
+            # Only consider a client disconnected if it hasn't been seen in 20 minutes
+            # This gives plenty of time for long-running tasks
+            disconnect_threshold = 1200  # 20 minutes (increased from 10 minutes)
 
-                # If client had pending tasks, return them to the queue
-                for task_id, individuals in list(self.pending_tasks.items()):
+            if current_time - client_info["last_seen"] > disconnect_threshold:
+                # Check if client has a pending task with progress updates
+                has_recent_progress = False
+
+                for task_id in self.pending_tasks:
                     if (
                         task_id in self.task_progress
-                        and self.task_progress[task_id]["client_id"] == client_id
+                        and self.task_progress[task_id].get("client_id") == client_id
                     ):
-                        logging.info(f"Returning task {task_id} to queue")
-                        self.population.extend(individuals)
-                        self.pending_tasks.pop(task_id)
+                        # If there's been progress in the last 10 minutes, don't disconnect
+                        last_update = self.task_progress[task_id].get("last_update", 0)
+                        if current_time - last_update < 600:  # 10 minutes
+                            has_recent_progress = True
+                            break
 
-                        # Remove from task progress
-                        if task_id in self.task_progress:
-                            del self.task_progress[task_id]
+                # Only disconnect if there's no recent progress
+                if not has_recent_progress:
+                    logging.warning(
+                        f"Client {client_id} ({client_info['hostname']}) appears to be disconnected"
+                    )
+                    disconnected_clients.append(client_id)
+
+                    # If client had pending tasks, return them to the queue
+                    for task_id, individuals in list(self.pending_tasks.items()):
+                        if (
+                            task_id in self.task_progress
+                            and self.task_progress[task_id].get("client_id")
+                            == client_id
+                        ):
+                            logging.info(f"Returning task {task_id} to queue")
+                            self.population.extend(individuals)
+                            self.pending_tasks.pop(task_id)
+
+                            # Remove from task progress
+                            if task_id in self.task_progress:
+                                del self.task_progress[task_id]
 
         # Remove disconnected clients
         for client_id in disconnected_clients:
@@ -1496,8 +1530,23 @@ class OptimizationClient(DistributedOptimizer):
         start_time = time.time()
         last_progress_time = start_time
 
+        # Check if we should continue processing or if the task was cancelled
+        task_cancelled = False
+
         for future in futures:
             try:
+                # Check if we've received a re-registration request (indicating task cancellation)
+                if self.pending_reregistration:
+                    logging.warning(
+                        f"Task {task_id} appears to have been cancelled by the server"
+                    )
+                    task_cancelled = True
+                    # Cancel remaining futures if possible
+                    for f in futures:
+                        if not f.done():
+                            f.cancel()
+                    break
+
                 # Wait for the future to complete
                 result = future.result()
 
@@ -1559,12 +1608,14 @@ class OptimizationClient(DistributedOptimizer):
             ).encode()
         )
 
-        # Send results back to server
-        await self.dealer_socket.send(
-            json.dumps(
-                {"type": "result", "task_id": task_id, "results": results}
-            ).encode()
-        )
+        # Only send results if the task wasn't cancelled
+        if not task_cancelled and results:
+            # Send results back to server
+            await self.dealer_socket.send(
+                json.dumps(
+                    {"type": "result", "task_id": task_id, "results": results}
+                ).encode()
+            )
 
         # Signal ready for more tasks immediately
         await self.dealer_socket.send(json.dumps({"type": "ready"}).encode())
@@ -1850,6 +1901,11 @@ class OptimizationClient(DistributedOptimizer):
         status_task = asyncio.create_task(self.status_listener())
         adaptive_task = asyncio.create_task(self.adaptive_worker_count())
 
+        # Track if we're currently processing a task
+        self.is_processing_task = False
+        # Track if we need to re-register after task completion
+        self.pending_reregistration = False
+
         # Main message handling loop
         while True:
             try:
@@ -1860,59 +1916,66 @@ class OptimizationClient(DistributedOptimizer):
                 if message["type"] == "task":
                     # Process optimization task
                     self.current_task = message
+                    self.is_processing_task = True
                     await self.process_task(message)
-                elif message["type"] == "ack":
-                    # Heartbeat acknowledgment, nothing to do
-                    pass
+                    self.is_processing_task = False
+
+                    # If we received re-registration requests during task processing,
+                    # handle them now
+                    if self.pending_reregistration:
+                        self.pending_reregistration = False
+                        await self.register_with_server()
+
+                    elif message["type"] == "ack":
+                        # Heartbeat acknowledgment, nothing to do
+                        pass
+
                 elif message["type"] == "reregister":
                     # Server doesn't recognize us, re-register
-                    logging.info("Server requested re-registration")
-                    resource_info = {
-                        "cpu_count": multiprocessing.cpu_count(),
-                        "workers": self.n_workers,
-                        "max_cpu_percent": self.max_cpu_percent,
-                        "max_memory_percent": self.max_memory_percent,
-                        "total_memory": psutil.virtual_memory().total,
-                    }
-                    await self.dealer_socket.send(
-                        json.dumps(
-                            {
-                                "type": "register",
-                                "hostname": self.hostname,
-                                "resources": resource_info,
-                            }
-                        ).encode()
-                    )
+                    if self.is_processing_task:
+                        # If we're processing a task, defer re-registration until after completion
+                        logging.info(
+                            "Server requested re-registration, will do after task completion"
+                        )
+                        self.pending_reregistration = True
+                    else:
+                        logging.info("Server requested re-registration")
+                        await self.register_with_server()
+
+                elif message["type"] == "registered":
+                    # We've been registered, nothing more to do
+                    logging.info("Received registration confirmation from server")
+
                 else:
                     logging.info(f"Received message: {message['type']}")
 
             except Exception as e:
                 logging.error(f"Error in client loop: {e}")
                 import traceback
+            traceback.print_exc()
 
-                traceback.print_exc()
+            # If we were processing a task, report the error
+            if self.current_task and self.is_processing_task:
+                try:
+                    await self.dealer_socket.send(
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "task_id": self.current_task["task_id"],
+                                "error": str(e),
+                            }
+                        ).encode()
+                    )
 
-                # If we were processing a task, report the error
-                if self.current_task:
-                    try:
-                        await self.dealer_socket.send(
-                            json.dumps(
-                                {
-                                    "type": "error",
-                                    "task_id": self.current_task["task_id"],
-                                    "error": str(e),
-                                }
-                            ).encode()
-                        )
+                    # Signal ready for more tasks
+                    await self.dealer_socket.send(
+                        json.dumps({"type": "ready"}).encode()
+                    )
 
-                        # Signal ready for more tasks
-                        await self.dealer_socket.send(
-                            json.dumps({"type": "ready"}).encode()
-                        )
-
-                        self.current_task = None
-                    except:
-                        pass
+                    self.current_task = None
+                    self.is_processing_task = False
+                except:
+                    pass
 
     def cleanup(self):
         """Clean up resources before exit"""
