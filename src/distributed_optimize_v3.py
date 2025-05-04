@@ -3818,6 +3818,11 @@ async def main():
         help="Maximum CPU usage percentage (client mode only)",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume optimization from checkpoint if available (server mode only)",
+    )
+    parser.add_argument(
         "--max-memory",
         type=int,
         default=80,
