@@ -1736,7 +1736,7 @@ class OptimizationClient(DistributedOptimizer):
         self.max_memory_percent = args.max_memory
         self.aggressiveness = args.aggressiveness
         self.optimize_memory_flag = args.optimize_memory
-        self.use_compression = args.compress
+        self.use_compression = args.compression
 
         # GPU settings
         self.use_gpu = args.use_gpu
@@ -2983,6 +2983,17 @@ class OptimizationClient(DistributedOptimizer):
                         )
                         await self.register_with_server()
                         missed_heartbeats = 0
+                    elif response_data["type"] == "registered":
+                        # This is a registration confirmation, not an expected heartbeat response
+                        logging.info(
+                            "Received registration confirmation during heartbeat"
+                        )
+                        self.config = response_data.get("config", self.config)
+                        missed_heartbeats = 0
+                        # Signal ready for tasks
+                        await self.dealer_socket.send(
+                            json.dumps({"type": "ready"}).encode()
+                        )
                     elif response_data["type"] == "task":
                         # We got a task instead of an ack - handle it
                         logging.info("Received task during heartbeat")
@@ -3799,11 +3810,6 @@ async def main():
         default=10,
         help="Number of individuals to send in each task (server mode only)",
     )
-    parser.add_argument(
-        "--compression",
-        action="store_true",
-        help="Enable compression for large messages (server mode only)",
-    )
 
     # Client-specific arguments
     parser.add_argument(
@@ -3866,6 +3872,19 @@ async def main():
         help="GPU ID to use (client mode only)",
     )
     parser.add_argument(
+        "--gpu-type",
+        type=str,
+        default="auto",
+        choices=["auto", "nvidia", "amd", "none"],
+        help="GPU type to use (auto, nvidia, amd, none) (client mode only)",
+    )
+    parser.add_argument(
+        "--max-gpu-memory",
+        type=int,
+        default=85,
+        help="Maximum GPU memory usage percentage (client mode only)",
+    )
+    parser.add_argument(
         "--hybrid-mode",
         action="store_true",
         help="Use both GPU and CPU for processing (client mode only)",
@@ -3888,6 +3907,11 @@ async def main():
         type=int,
         default=300,  # 5 minutes in seconds
         help="Interval in seconds between saving checkpoints (server mode only)",
+    )
+    parser.add_argument(
+        "--compression",
+        action="store_true",
+        help="Enable compression for large messages (client mode only)",
     )
 
     args = parser.parse_args()
