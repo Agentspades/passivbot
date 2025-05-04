@@ -530,7 +530,7 @@ class OptimizationServer(DistributedOptimizer):
             )
 
     async def send_tasks_to_client(self, client_id):
-        """Send optimization tasks to a client with adaptive batch sizing and better error handling"""
+        """Send optimization tasks to a client with rate limiting to prevent overloading"""
         if not self.population:
             # No more tasks to send
             return
@@ -550,9 +550,25 @@ class OptimizationServer(DistributedOptimizer):
             logging.info(f"Client {client_id} is already busy, not sending more tasks")
             return
 
+        # Check how many pending tasks this client already has
+        client_pending_tasks = sum(
+            1
+            for task_id, task_info in self.pending_tasks.items()
+            if isinstance(task_info, dict) and task_info.get("client_id") == client_id
+        )
+
+        # Limit the number of pending tasks per client based on their worker count
+        client_workers = client_info.get("resources", {}).get("workers", 2)
+        max_pending_tasks = max(1, client_workers // 2)  # At most half the worker count
+
+        if client_pending_tasks >= max_pending_tasks:
+            logging.info(
+                f"Client {client_id} already has {client_pending_tasks} pending tasks, not sending more"
+            )
+            return
+
         # Determine batch size based on client resources
         client_cpu_count = client_info.get("resources", {}).get("cpu_count", 4)
-        client_workers = client_info.get("resources", {}).get("workers", 2)
 
         # Scale batch size based on client's worker count
         # More powerful clients get larger batches
@@ -569,9 +585,8 @@ class OptimizationServer(DistributedOptimizer):
 
         # Create task
         task_id = str(uuid.uuid4())
-        self.pending_tasks[task_id] = individuals
 
-        # Record task creation time
+        # Record task creation time and details
         self.pending_tasks[task_id] = {
             "individuals": individuals,
             "created_at": time.time(),
@@ -611,16 +626,16 @@ class OptimizationServer(DistributedOptimizer):
         except Exception as e:
             logging.error(f"Error sending task to client {client_id}: {e}")
 
-            # Return individuals to population
-            self.population.extend(individuals)
+        # Return individuals to population
+        self.population.extend(individuals)
 
-            # Remove from pending tasks
-            if task_id in self.pending_tasks:
-                self.pending_tasks.pop(task_id)
+        # Remove from pending tasks
+        if task_id in self.pending_tasks:
+            self.pending_tasks.pop(task_id)
 
-            # Remove from task progress
-            if task_id in self.task_progress:
-                del self.task_progress[task_id]
+        # Remove from task progress
+        if task_id in self.task_progress:
+            del self.task_progress[task_id]
 
     async def process_results(self, results):
         """Process optimization results from clients"""
@@ -1343,42 +1358,54 @@ class OptimizationClient(DistributedOptimizer):
         return False
 
     async def reconnect_to_server(self):
-        """Reconnect to server after a disconnection"""
+        """Reconnect to server after a disconnection with better error handling"""
         logging.info("Attempting to reconnect to server...")
 
-        # Close existing sockets
-        self.dealer_socket.close()
-        self.sub_socket.close()
+        try:
+            # Close existing sockets
+            self.dealer_socket.close()
+            self.sub_socket.close()
 
-        # Create new sockets
-        self.dealer_socket = self.context.socket(zmq.DEALER)
-        self.sub_socket = self.context.socket(zmq.SUB)
+            # Create new sockets
+            self.dealer_socket = self.context.socket(zmq.DEALER)
+            self.sub_socket = self.context.socket(zmq.SUB)
 
-        # Set client ID in socket
-        self.dealer_socket.setsockopt(zmq.IDENTITY, self.node_id.encode())
+            # Set client ID in socket
+            self.dealer_socket.setsockopt(zmq.IDENTITY, self.node_id.encode())
 
-        # Set socket options for more reliable connections
-        self.dealer_socket.setsockopt(
-            zmq.RECONNECT_IVL, 1000
-        )  # Reconnect after 1 second
-        self.dealer_socket.setsockopt(
-            zmq.RECONNECT_IVL_MAX, 10000
-        )  # Max 10 seconds between reconnects
-        self.dealer_socket.setsockopt(
-            zmq.LINGER, 0
-        )  # Don't wait for unsent messages when closing
+            # Set socket options for more reliable connections
+            self.dealer_socket.setsockopt(
+                zmq.RECONNECT_IVL, 1000
+            )  # Reconnect after 1 second
+            self.dealer_socket.setsockopt(
+                zmq.RECONNECT_IVL_MAX, 10000
+            )  # Max 10 seconds between reconnects
+            self.dealer_socket.setsockopt(
+                zmq.LINGER, 0
+            )  # Don't wait for unsent messages when closing
 
-        # Connect to server
-        server_host, server_port = self.server_address.split(":")
-        self.dealer_socket.connect(f"tcp://{server_host}:{server_port}")
-        self.sub_socket.connect(f"tcp://{server_host}:{int(server_port)+1}")
-        self.sub_socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all messages
+            # Connect to server
+            server_host, server_port = self.server_address.split(":")
+            self.dealer_socket.connect(f"tcp://{server_host}:{server_port}")
+            self.sub_socket.connect(f"tcp://{server_host}:{int(server_port)+1}")
+            self.sub_socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all messages
 
-        # Give ZMQ connections time to establish
-        await asyncio.sleep(2)
+            # Give ZMQ connections time to establish
+            await asyncio.sleep(2)
 
-        # Register with server
-        return await self.register_with_server()
+            # Register with server
+            return await self.register_with_server()
+
+        except asyncio.CancelledError:
+            logging.warning("Reconnection attempt was cancelled")
+            return False
+
+        except Exception as e:
+            logging.error(f"Error during reconnection: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
 
     async def setup(self):
         """Connect to server and register"""
@@ -1747,6 +1774,12 @@ class OptimizationClient(DistributedOptimizer):
 
         while True:
             try:
+                # Skip heartbeat if we're currently processing a task
+                # This reduces unnecessary network traffic during intensive computation
+                if self.is_processing_task:
+                    await asyncio.sleep(heartbeat_interval)
+                    continue
+
                 # Get current resource usage
                 cpu_percent = psutil.cpu_percent(interval=0.5)
                 memory_percent = psutil.virtual_memory().percent
@@ -1812,6 +1845,14 @@ class OptimizationClient(DistributedOptimizer):
                         else:
                             # If reconnection fails, wait before trying again
                             await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    # This is expected during shutdown
+                    logging.info("Heartbeat loop cancelled")
+                    raise
+            except asyncio.CancelledError:
+                # This is expected during shutdown
+                logging.info("Heartbeat loop cancelled")
+                raise
             except Exception as e:
                 logging.error(f"Error in heartbeat loop: {e}")
                 missed_heartbeats += 1
@@ -1829,93 +1870,61 @@ class OptimizationClient(DistributedOptimizer):
             await asyncio.sleep(heartbeat_interval)
 
     async def register_with_server(self):
-        """Register with the server"""
-        # Try registration up to 3 times
-        for attempt in range(3):
+        """Register with the server and initialize the evaluator"""
+        try:
+            # Get resource information
+            resource_info = {
+                "cpu_count": multiprocessing.cpu_count(),
+                "workers": self.n_workers,
+                "max_cpu_percent": self.max_cpu_percent,
+                "max_memory_percent": self.max_memory_percent,
+                "total_memory": psutil.virtual_memory().total,
+            }
+
+            # Send registration message
+            await self.dealer_socket.send(
+                json.dumps(
+                    {
+                        "type": "register",
+                        "hostname": self.hostname,
+                        "resources": resource_info,
+                    }
+                ).encode()
+            )
+
+            # Wait for registration confirmation with timeout
             try:
-                resource_info = {
-                    "cpu_count": multiprocessing.cpu_count(),
-                    "workers": self.n_workers,
-                    "max_cpu_percent": self.max_cpu_percent,
-                    "max_memory_percent": self.max_memory_percent,
-                    "total_memory": psutil.virtual_memory().total,
-                }
-
-                await self.dealer_socket.send(
-                    json.dumps(
-                        {
-                            "type": "register",
-                            "hostname": self.hostname,
-                            "resources": resource_info,
-                        }
-                    ).encode()
+                message = await asyncio.wait_for(
+                    self.dealer_socket.recv(), timeout=30.0
                 )
+                message = json.loads(message.decode())
 
-                # Wait for registration confirmation with timeout
-                try:
-                    message = await asyncio.wait_for(
-                        self.dealer_socket.recv(), timeout=10.0
+                if message["type"] == "registered":
+                    logging.info(f"Successfully registered with server")
+                    self.config = message["config"]
+
+                    # Initialize evaluator if not already done
+                    if not hasattr(self, "evaluator") or self.evaluator is None:
+                        await self.initialize_evaluator()
+
+                    # Signal ready for tasks
+                    await self.dealer_socket.send(
+                        json.dumps({"type": "ready"}).encode()
                     )
-                    message = json.loads(message.decode())
+                    return True
+                else:
+                    logging.error(f"Failed to register with server: {message}")
+                    return False
+            except asyncio.TimeoutError:
+                logging.error("Timeout waiting for registration confirmation")
+                return False
 
-                    if message["type"] == "registered":
-                        logging.info(f"Successfully registered with server")
-                        # Only update config if it's provided and we don't already have one
-                        if "config" in message and self.config is None:
-                            self.config = message["config"]
-                            # Initialize evaluator if needed
-                            if self.evaluator is None:
-                                await self.initialize_evaluator()
+        except Exception as e:
+            logging.error(f"Error during registration: {e}")
+            import traceback
 
-                        # Signal ready for tasks
-                        await self.dealer_socket.send(
-                            json.dumps({"type": "ready"}).encode()
-                        )
-                        return True
-                    elif message["type"] == "reregister":
-                        # Server wants us to register again, which we're already doing
-                        logging.info(
-                            "Server requested re-registration during registration, retrying..."
-                        )
-                        await asyncio.sleep(1)  # Wait a bit before retrying
-                        continue
-                    elif message["type"] == "task":
-                        # Server sent us a task before we're ready - ignore it and try again
-                        logging.error(
-                            f"Unexpected response during registration: {message}"
-                        )
-                        logging.info(
-                            "Server sent a task before registration was complete, retrying..."
-                        )
-                        # Send a message to server indicating we're not ready
-                        await self.dealer_socket.send(
-                            json.dumps(
-                                {
-                                    "type": "not_ready",
-                                    "message": "Client is still registering, please wait",
-                                }
-                            ).encode()
-                        )
-                        await asyncio.sleep(2)  # Wait a bit longer before retrying
-                        continue
-                    else:
-                        logging.error(
-                            f"Unexpected response during registration: {message}"
-                        )
-                        await asyncio.sleep(1)  # Wait a bit before retrying
-                        continue
-                except asyncio.TimeoutError:
-                    logging.error("Registration timed out, retrying...")
-                    continue
-            except Exception as e:
-                logging.error(f"Error during registration: {e}")
-                import traceback
-
-                traceback.print_exc()
-                await asyncio.sleep(2)  # Wait before retrying
-
-        logging.error("Failed to register after multiple attempts")
-        return False
+            traceback.print_exc()
+            return False
 
     async def status_listener(self):
         """Listen for status broadcasts from server"""
@@ -2095,10 +2104,13 @@ class OptimizationClient(DistributedOptimizer):
     async def run(self):
         """Main client loop with robust error handling"""
         # Set up process pool
-        self.process_pool = ProcessPoolExecutor(max_workers=self.n_workers)
+        self.process_pool = ProcessPoolExecutor(max_workers=self.max_workers)
 
         # Prewarm the process pool
         self.prewarm_process_pool()
+
+        # Initialize worker semaphore
+        self.worker_semaphore = asyncio.Semaphore(self.n_workers)
 
         # Connect to server
         server_host, server_port = self.server_address.split(":")
@@ -2114,14 +2126,13 @@ class OptimizationClient(DistributedOptimizer):
         self.dealer_socket.setsockopt(
             zmq.LINGER, 0
         )  # Don't wait for unsent messages when closing
-        self.dealer_socket.setsockopt(zmq.RCVTIMEO, 60000)  # 60 second receive timeout
 
         self.dealer_socket.connect(f"tcp://{server_host}:{server_port}")
         self.sub_socket.connect(f"tcp://{server_host}:{int(server_port)+1}")
         self.sub_socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all messages
 
         # Give ZMQ connections time to establish
-        await asyncio.sleep(5)
+        await asyncio.sleep(1)
 
         # Register with server
         registration_success = await self.register_with_server()
@@ -2190,67 +2201,91 @@ class OptimizationClient(DistributedOptimizer):
                             # If reconnection fails, wait before trying again
                             await asyncio.sleep(10)
 
-        except zmq.ZMQError as e:
-            # Handle ZMQ-specific errors
-            logging.error(f"ZMQ error: {e}")
+                except asyncio.CancelledError:
+                    logging.warning("Client operation was cancelled, cleaning up")
+                    break
 
-            if e.errno == zmq.EAGAIN:
-                # Resource temporarily unavailable (timeout)
-                connection_failures += 1
-                logging.warning(f"ZMQ timeout (failures: {connection_failures})")
+                except zmq.ZMQError as e:
+                    # Handle ZMQ-specific errors
+                    logging.error(f"ZMQ error: {e}")
 
-                if connection_failures >= 3:
-                    # Try to reconnect after 3 consecutive failures
-                    logging.error(
-                        "Connection appears to be lost, attempting to reconnect"
-                    )
-                    if await self.reconnect_to_server():
-                        connection_failures = 0
+                    if e.errno == zmq.EAGAIN:
+                        # Resource temporarily unavailable (timeout)
+                        connection_failures += 1
+                        logging.warning(
+                            f"ZMQ timeout (failures: {connection_failures})"
+                        )
+
+                        if connection_failures >= 3:
+                            # Try to reconnect after 3 consecutive failures
+                            logging.error(
+                                "Connection appears to be lost, attempting to reconnect"
+                            )
+                            if await self.reconnect_to_server():
+                                connection_failures = 0
+                            else:
+                                # If reconnection fails, wait before trying again
+                                await asyncio.sleep(10)
                     else:
-                        # If reconnection fails, wait before trying again
-                        await asyncio.sleep(10)
-            else:
-                # Other ZMQ errors - try to reconnect
-                logging.error("Attempting to reconnect due to ZMQ error")
-                if await self.reconnect_to_server():
-                    connection_failures = 0
-                else:
-                    # If reconnection fails, wait before trying again
-                    await asyncio.sleep(10)
+                        # Other ZMQ errors - try to reconnect
+                        logging.error("Attempting to reconnect due to ZMQ error")
+                        if await self.reconnect_to_server():
+                            connection_failures = 0
+                        else:
+                            # If reconnection fails, wait before trying again
+                            await asyncio.sleep(10)
+
+                except Exception as e:
+                    logging.error(f"Error in client loop: {e}")
+                    import traceback
+
+                    traceback.print_exc()
+
+                    # If we were processing a task, report the error
+                    if self.current_task and self.is_processing_task:
+                        try:
+                            await self.dealer_socket.send(
+                                json.dumps(
+                                    {
+                                        "type": "error",
+                                        "task_id": self.current_task["task_id"],
+                                        "error": str(e),
+                                    }
+                                ).encode()
+                            )
+
+                            # Signal ready for more tasks
+                            await self.dealer_socket.send(
+                                json.dumps({"type": "ready"}).encode()
+                            )
+
+                            self.current_task = None
+                            self.is_processing_task = False
+                        except:
+                            pass
+
+                    # Wait a bit before continuing
+                    await asyncio.sleep(5)
+
+        except asyncio.CancelledError:
+            logging.warning("Client operation was cancelled, cleaning up")
 
         except Exception as e:
-            logging.error(f"Error in client loop: {e}")
+            logging.error(f"Unhandled exception in client run loop: {e}")
             import traceback
 
             traceback.print_exc()
 
-            # If we were processing a task, report the error
-            if self.current_task and self.is_processing_task:
-                try:
-                    await self.dealer_socket.send(
-                        json.dumps(
-                            {
-                                "type": "error",
-                                "task_id": self.current_task["task_id"],
-                                "error": str(e),
-                            }
-                        ).encode()
-                    )
-
-                    # Signal ready for more tasks
-                    await self.dealer_socket.send(
-                        json.dumps({"type": "ready"}).encode()
-                    )
-
-                    self.current_task = None
-                    self.is_processing_task = False
-                except:
-                    pass
-
-            # Wait a bit before continuing
-            await asyncio.sleep(5)
-
         finally:
+            # Cancel background tasks
+            for task in [heartbeat_task, status_task, adaptive_task]:
+                if task and not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
             # Clean up resources
             self.cleanup()
 
@@ -2376,7 +2411,12 @@ async def main():
                 parser.error("--server is required in client mode")
 
             client = OptimizationClient(args)
-            await client.run()
+            try:
+                await client.run()
+            except asyncio.CancelledError:
+                logging.info("Client run was cancelled, performing cleanup")
+                # This is expected during shutdown, not an error
+                pass
     except KeyboardInterrupt:
         logging.info("Interrupted by user, shutting down...")
     except Exception as e:
@@ -2387,7 +2427,10 @@ async def main():
     finally:
         # Clean up resources
         if args.mode == "client" and client is not None:
-            client.cleanup()
+            try:
+                client.cleanup()
+            except Exception as e:
+                logging.error(f"Error during cleanup: {e}")
 
         logging.info("Exiting...")
 
