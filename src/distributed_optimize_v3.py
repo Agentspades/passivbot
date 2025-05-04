@@ -734,7 +734,7 @@ class OptimizationServer(DistributedOptimizer):
         self.sig_digits = 6
         self.seen_hashes = {}
         self.task_progress = {}
-        self.use_compression = args.compress
+        self.use_compression = args.compression
 
         # GPU-related parameters
         self.use_gpu = args.use_gpu
