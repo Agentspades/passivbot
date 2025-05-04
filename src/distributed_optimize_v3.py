@@ -1798,7 +1798,7 @@ class OptimizationClient(DistributedOptimizer):
             else:  # Linux or other systems
                 self.n_workers = max(1, int(total_cpus * 0.7 * self.aggressiveness))
 
-        # If using GPU, reduce CPU worker count slightly to avoid resource contention
+            # If using GPU, reduce CPU worker count slightly to avoid resource contention
         if self.use_gpu and self.gpu_manager and self.gpu_manager.available:
             self.n_workers = max(1, int(self.n_workers * 0.8))
             logging.info(f"Reduced worker count to {self.n_workers} due to GPU usage")
@@ -1860,6 +1860,65 @@ class OptimizationClient(DistributedOptimizer):
         self.hybrid_mode = args.hybrid_mode
         self.gpu_batch_size = args.gpu_batch_size
         self.cpu_batch_size = args.cpu_batch_size
+
+    # Add this method to the OptimizationClient class
+
+    def ensure_worker_cpu_intensive(self, worker_id):
+        """
+        Ensure that worker processes are CPU-intensive by setting process affinity
+        and priority appropriately.
+        """
+        try:
+            # Get current process
+            process = psutil.Process()
+
+            # Set CPU affinity if supported
+            if (
+                hasattr(process, "cpu_affinity")
+                and self.max_workers <= psutil.cpu_count()
+            ):
+                # Try to assign each worker to a specific CPU core
+                # This can improve performance by reducing context switching
+                try:
+                    # Calculate which core this worker should use
+                    core_id = worker_id % psutil.cpu_count()
+                    process.cpu_affinity([core_id])
+                    logging.debug(f"Worker {worker_id} assigned to CPU core {core_id}")
+                except Exception as e:
+                    logging.debug(f"Could not set CPU affinity: {e}")
+
+            # Set process priority
+            if sys.platform == "win32":
+                if self.args.priority == "high":
+                    process.nice(psutil.HIGH_PRIORITY_CLASS)
+                elif self.args.priority == "low":
+                    process.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+                else:
+                    process.nice(psutil.NORMAL_PRIORITY_CLASS)
+            else:
+                # Unix-like systems
+                if self.args.priority == "high":
+                    try:
+                        process.nice(-10)  # Higher priority (requires root)
+                    except:
+                        process.nice(0)  # Normal priority
+                elif self.args.priority == "low":
+                    process.nice(10)  # Lower priority
+                else:
+                    process.nice(0)  # Normal priority
+
+            # On Linux, set I/O priority to be lower
+            if sys.platform.startswith("linux"):
+                try:
+                    import os
+
+                    os.system(f"ionice -c 2 -n 7 -p {process.pid}")
+                except:
+                    pass
+            return True
+        except Exception as e:
+            logging.error(f"Error setting worker process properties: {e}")
+            return False
 
     def set_process_priority(self):
         """
@@ -2568,7 +2627,7 @@ class OptimizationClient(DistributedOptimizer):
                 await self.reconnect_to_server()
 
     async def process_individuals_cpu(self, individuals, overrides_list, task_id):
-        """Process individuals using CPU"""
+        """Process individuals using CPU with better worker management"""
         results = []
         processed = 0
         valid_results = 0
@@ -2577,11 +2636,12 @@ class OptimizationClient(DistributedOptimizer):
 
         # Create tasks for each individual
         tasks = []
-        for individual in individuals:
-            # Create a task for each individual
+        for i, individual in enumerate(individuals):
+            # Create a task for each individual with a worker ID
+            worker_id = i % self.n_workers  # Assign a worker ID based on position
             tasks.append(
                 self.process_individual(
-                    individual, overrides_list, self.worker_semaphore
+                    individual, overrides_list, self.worker_semaphore, worker_id
                 )
             )
 
@@ -2613,6 +2673,57 @@ class OptimizationClient(DistributedOptimizer):
                 self.optimize_memory_usage()
 
         return results
+
+    # Add this method to the OptimizationClient class
+
+    async def monitor_cpu_utilization(self):
+        """
+        Monitor CPU utilization and adjust worker count more aggressively
+        to ensure we're maximizing CPU usage.
+        """
+        check_interval = 10  # Check every 10 seconds
+
+        while True:
+            try:
+                # Get per-CPU utilization
+                per_cpu = psutil.cpu_percent(interval=1, percpu=True)
+                avg_cpu = sum(per_cpu) / len(per_cpu)
+
+                # Count how many CPUs are underutilized
+                underutilized = sum(1 for cpu in per_cpu if cpu < 50)
+
+                # Log current utilization
+                logging.debug(f"CPU utilization: {avg_cpu:.1f}% (per-core: {per_cpu})")
+
+                # If we have more than 2 underutilized CPUs and we're not at max workers
+                if underutilized > 2 and self.n_workers < self.max_workers:
+                    # Increase worker count more aggressively
+                    old_workers = self.n_workers
+                    increase = min(underutilized, self.max_workers - self.n_workers)
+                    self.n_workers = min(self.n_workers + increase, self.max_workers)
+
+                    if self.n_workers != old_workers:
+                        logging.info(
+                            f"Increasing workers from {old_workers} to {self.n_workers} due to {underutilized} underutilized CPUs"
+                        )
+                        self.worker_semaphore = asyncio.Semaphore(self.n_workers)
+
+                # If average CPU is very high, check if we need to back off
+                elif avg_cpu > 90 and self.n_workers > 1:
+                    # Slightly reduce worker count to avoid system becoming unresponsive
+                    old_workers = self.n_workers
+                    self.n_workers = max(1, self.n_workers - 1)
+
+                    if self.n_workers != old_workers:
+                        logging.info(
+                            f"Reducing workers from {old_workers} to {self.n_workers} due to high CPU usage ({avg_cpu:.1f}%)"
+                        )
+                        self.worker_semaphore = asyncio.Semaphore(self.n_workers)
+
+            except Exception as e:
+                logging.error(f"Error in CPU utilization monitor: {e}")
+
+            await asyncio.sleep(check_interval)
 
     async def process_individuals_gpu(self, individuals, overrides_list, task_id):
         """Process individuals using GPU acceleration"""
@@ -2863,7 +2974,9 @@ class OptimizationClient(DistributedOptimizer):
 
         return results
 
-    async def process_individual(self, individual, overrides_list, worker_semaphore):
+    async def process_individual(
+        self, individual, overrides_list, worker_semaphore, worker_id=0
+    ):
         """Process a single individual with resource management"""
         try:
             # Check if we should pause due to high resource usage
@@ -2876,9 +2989,14 @@ class OptimizationClient(DistributedOptimizer):
 
                 # Run the evaluation in a separate thread to avoid blocking the event loop
                 loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(
-                    None,
-                    lambda: evaluate_individual_wrapper(
+
+                # Create a function that will run in the process pool
+                def process_with_cpu_optimization():
+                    # Try to optimize this process for CPU usage
+                    self.ensure_worker_cpu_intensive(worker_id)
+
+                    # Now evaluate the individual
+                    return evaluate_individual_wrapper(
                         individual,
                         overrides_list,
                         self.config,
@@ -2888,9 +3006,12 @@ class OptimizationClient(DistributedOptimizer):
                         self.btc_usd_shared_memory_files,
                         self.btc_usd_dtypes,
                         self.msss,
-                    ),
-                )
+                    )
 
+                # Run in process pool
+                result = await loop.run_in_executor(
+                    self.process_pool, process_with_cpu_optimization
+                )
                 # Log completion time
                 end_time = time.time()
                 logging.info(
@@ -3386,6 +3507,9 @@ class OptimizationClient(DistributedOptimizer):
         heartbeat_task = asyncio.create_task(self.heartbeat_loop())
         status_task = asyncio.create_task(self.status_listener())
         adaptive_task = asyncio.create_task(self.adaptive_worker_count())
+        cpu_monitor_task = asyncio.create_task(
+            self.monitor_cpu_utilization()
+        )  # Add this line
 
         # Track if we're currently processing a task
         self.is_processing_task = False
@@ -3542,7 +3666,7 @@ class OptimizationClient(DistributedOptimizer):
 
         finally:
             # Cancel background tasks
-            for task in [heartbeat_task, status_task, adaptive_task]:
+            for task in [heartbeat_task, status_task, adaptive_task, cpu_monitor_task]:
                 if task and not task.done():
                     task.cancel()
                     try:
