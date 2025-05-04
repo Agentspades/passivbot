@@ -3878,6 +3878,13 @@ async def main():
         help="Batch size for CPU processing in hybrid mode (client mode only)",
     )
 
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=300,  # 5 minutes in seconds
+        help="Interval in seconds between saving checkpoints (server mode only)",
+    )
+
     args = parser.parse_args()
 
     # Create and run the appropriate component
