@@ -9,7 +9,7 @@
         ],
         "gap_tolerance_ohlcvs_minutes": 120.0,
         "start_date": "2023-01-01",
-        "starting_balance": 100.0,
+        "starting_balance": 150.0,
         "use_btc_collateral": false
     },
     "bot": {

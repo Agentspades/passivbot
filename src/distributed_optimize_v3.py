@@ -701,6 +701,56 @@ class GPUManager:
             await asyncio.sleep(self.check_interval)
 
 
+def process_with_cpu_optimization(
+    worker_id,
+    individual,
+    overrides_list,
+    config,
+    shared_memory_files,
+    hlcvs_shapes,
+    hlcvs_dtypes,
+    btc_usd_shared_memory_files,
+    btc_usd_dtypes,
+    msss,
+):
+    """Process an individual with CPU optimization - must be at module level to be picklable"""
+    # Try to optimize this process for CPU usage
+    try:
+        # Get current process
+        process = psutil.Process()
+
+        # Set CPU affinity if supported
+        if hasattr(process, "cpu_affinity"):
+            try:
+                # Calculate which core this worker should use
+                core_id = worker_id % psutil.cpu_count()
+                process.cpu_affinity([core_id])
+            except Exception as e:
+                pass  # Ignore affinity errors
+
+        # Set process priority
+        if sys.platform == "win32":
+            process.nice(psutil.NORMAL_PRIORITY_CLASS)
+        else:
+            # Unix-like systems
+            process.nice(0)  # Normal priority
+    except Exception as e:
+        pass  # Ignore process optimization errors
+
+    # Now evaluate the individual
+    return evaluate_individual_wrapper(
+        individual,
+        overrides_list,
+        config,
+        shared_memory_files,
+        hlcvs_shapes,
+        hlcvs_dtypes,
+        btc_usd_shared_memory_files,
+        btc_usd_dtypes,
+        msss,
+    )
+
+
 class DistributedOptimizer:
     """Base class for both server and client implementations"""
 
@@ -2990,28 +3040,22 @@ class OptimizationClient(DistributedOptimizer):
                 # Run the evaluation in a separate thread to avoid blocking the event loop
                 loop = asyncio.get_event_loop()
 
-                # Create a function that will run in the process pool
-                def process_with_cpu_optimization():
-                    # Try to optimize this process for CPU usage
-                    self.ensure_worker_cpu_intensive(worker_id)
-
-                    # Now evaluate the individual
-                    return evaluate_individual_wrapper(
-                        individual,
-                        overrides_list,
-                        self.config,
-                        self.shared_memory_files,
-                        self.hlcvs_shapes,
-                        self.hlcvs_dtypes,
-                        self.btc_usd_shared_memory_files,
-                        self.btc_usd_dtypes,
-                        self.msss,
-                    )
-
-                # Run in process pool
+                # Run in process pool with the module-level function
                 result = await loop.run_in_executor(
-                    self.process_pool, process_with_cpu_optimization
+                    self.process_pool,
+                    process_with_cpu_optimization,
+                    worker_id,
+                    individual,
+                    overrides_list,
+                    self.config,
+                    self.shared_memory_files,
+                    self.hlcvs_shapes,
+                    self.hlcvs_dtypes,
+                    self.btc_usd_shared_memory_files,
+                    self.btc_usd_dtypes,
+                    self.msss,
                 )
+
                 # Log completion time
                 end_time = time.time()
                 logging.info(
@@ -3246,6 +3290,20 @@ class OptimizationClient(DistributedOptimizer):
                     await self.dealer_socket.send(
                         json.dumps({"type": "ready"}).encode()
                     )
+                    return True
+                elif message_data["type"] == "task":
+                    # Server sent a task immediately after registration
+                    logging.info(f"Received task during registration")
+                    self.config = message_data.get("config", self.config)
+
+                    # Initialize evaluator if not already done
+                    if not hasattr(self, "evaluator") or self.evaluator is None:
+                        await self.initialize_evaluator()
+
+                    # Process the task
+                    self.current_task = message_data
+                    self.is_processing_task = True
+                    asyncio.create_task(self.process_task(message_data))
                     return True
                 else:
                     logging.error(f"Failed to register with server: {message_data}")
