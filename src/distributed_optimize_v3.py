@@ -74,6 +74,80 @@ def dummy_task(x):
     return result
 
 
+def process_with_cached_evaluator(
+    individual,
+    overrides_list,
+    config,
+    shared_memory_files,
+    hlcvs_shapes,
+    hlcvs_dtypes,
+    btc_usd_shared_memory_files,
+    btc_usd_dtypes,
+    msss,
+    worker_id,
+):
+    """Process an individual with a cached evaluator (module-level function for pickling)"""
+    # Try to optimize this process for CPU usage
+    try:
+        # Get current process
+        process = psutil.Process()
+
+        # Set CPU affinity if supported
+        if hasattr(process, "cpu_affinity"):
+            try:
+                # Calculate which core this worker should use
+                core_id = worker_id % psutil.cpu_count()
+                process.cpu_affinity([core_id])
+            except Exception:
+                pass
+
+        # Set process priority
+        if sys.platform == "win32":
+            process.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+        else:
+            # Unix-like systems
+            process.nice(10)  # Lower priority
+    except Exception:
+        pass
+
+    from optimize import Evaluator, individual_to_config, optimizer_overrides
+    import multiprocessing
+
+    # Create a queue for this process
+    queue = multiprocessing.Queue()
+
+    # Create evaluator
+    evaluator = Evaluator(
+        shared_memory_files=shared_memory_files,
+        hlcvs_shapes=hlcvs_shapes,
+        hlcvs_dtypes=hlcvs_dtypes,
+        btc_usd_shared_memory_files=btc_usd_shared_memory_files,
+        btc_usd_dtypes=btc_usd_dtypes,
+        msss=msss,
+        config=config,
+        results_queue=queue,
+        seen_hashes={},
+        duplicate_counter={"count": 0},
+    )
+
+    # Evaluate the individual
+    objectives = evaluator.evaluate(individual, overrides_list)
+
+    # Get result from queue
+    result = queue.get()
+
+    # Add individual to result
+    result["individual"] = individual
+
+    # Ensure config is present
+    if "config" not in result:
+        result["config"] = individual_to_config(
+            individual, optimizer_overrides, overrides_list, template=config
+        )
+
+    return result
+
+
 class CachedEvaluator:
     """Caches the evaluator to prevent repeated initialization"""
 
@@ -3317,10 +3391,84 @@ class OptimizationClient(DistributedOptimizer):
 
         return results
 
+    # Add this function at module level (outside any class)
+    def process_with_cached_evaluator(
+        individual,
+        overrides_list,
+        config,
+        shared_memory_files,
+        hlcvs_shapes,
+        hlcvs_dtypes,
+        btc_usd_shared_memory_files,
+        btc_usd_dtypes,
+        msss,
+        worker_id,
+    ):
+        """Process an individual with a cached evaluator (module-level function for pickling)"""
+        # Try to optimize this process for CPU usage
+        try:
+            # Get current process
+            process = psutil.Process()
+
+            # Set CPU affinity if supported
+            if hasattr(process, "cpu_affinity"):
+                try:
+                    # Calculate which core this worker should use
+                    core_id = worker_id % psutil.cpu_count()
+                    process.cpu_affinity([core_id])
+                except Exception:
+                    pass
+
+            # Set process priority
+            if sys.platform == "win32":
+                process.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+            else:
+                # Unix-like systems
+                process.nice(10)  # Lower priority
+        except Exception:
+            pass
+
+        from optimize import Evaluator, individual_to_config, optimizer_overrides
+        import multiprocessing
+
+        # Create a queue for this process
+        queue = multiprocessing.Queue()
+
+        # Create evaluator
+        evaluator = Evaluator(
+            shared_memory_files=shared_memory_files,
+            hlcvs_shapes=hlcvs_shapes,
+            hlcvs_dtypes=hlcvs_dtypes,
+            btc_usd_shared_memory_files=btc_usd_shared_memory_files,
+            btc_usd_dtypes=btc_usd_dtypes,
+            msss=msss,
+            config=config,
+            results_queue=queue,
+            seen_hashes={},
+            duplicate_counter={"count": 0},
+        )
+
+        # Evaluate the individual
+        objectives = evaluator.evaluate(individual, overrides_list)
+
+        # Get result from queue
+        result = queue.get()
+
+        # Add individual to result
+        result["individual"] = individual
+
+        # Ensure config is present
+        if "config" not in result:
+            result["config"] = individual_to_config(
+                individual, optimizer_overrides, overrides_list, template=config
+            )
+
+        return result
+
     async def process_individual(
         self, individual, overrides_list, worker_semaphore, worker_id=0
     ):
-        """Process a single individual with resource management and cached evaluator"""
+        """Process a single individual with resource management"""
         try:
             # Check if we should pause due to high resource usage
             await self.resource_manager.wait_for_resources()
@@ -3333,53 +3481,20 @@ class OptimizationClient(DistributedOptimizer):
                 # Run the evaluation in a separate thread to avoid blocking the event loop
                 loop = asyncio.get_event_loop()
 
-                # Create a function that will run in the process pool
-                def process_with_cached_evaluator():
-                    # Try to optimize this process for CPU usage
-                    self.ensure_worker_cpu_intensive(worker_id)
-
-                    from optimize import individual_to_config, optimizer_overrides
-
-                    # Use the cached evaluator
-                    if not hasattr(self, "cached_evaluator"):
-                        # Log only once when creating the cached evaluator
-                        logging.info("Creating cached evaluator for better performance")
-                        self.cached_evaluator = CachedEvaluator(
-                            self.shared_memory_files,
-                            self.hlcvs_shapes,
-                            self.hlcvs_dtypes,
-                            self.btc_usd_shared_memory_files,
-                            self.btc_usd_dtypes,
-                            self.msss,
-                            self.config,
-                        )
-
-                    # Get evaluator and queue
-                    evaluator, queue = self.cached_evaluator.get_evaluator()
-
-                    # Evaluate the individual
-                    objectives = evaluator.evaluate(individual, overrides_list)
-
-                    # Get result from queue
-                    result = queue.get()
-
-                    # Add individual to result
-                    result["individual"] = individual
-
-                    # Ensure config is present
-                    if "config" not in result:
-                        result["config"] = individual_to_config(
-                            individual,
-                            optimizer_overrides,
-                            overrides_list,
-                            template=self.config,
-                        )
-
-                    return result
-
-                # Run in process pool
+                # Run in process pool using the module-level function
                 result = await loop.run_in_executor(
-                    self.process_pool, process_with_cached_evaluator
+                    self.process_pool,
+                    process_with_cached_evaluator,
+                    individual,
+                    overrides_list,
+                    self.config,
+                    self.shared_memory_files,
+                    self.hlcvs_shapes,
+                    self.hlcvs_dtypes,
+                    self.btc_usd_shared_memory_files,
+                    self.btc_usd_dtypes,
+                    self.msss,
+                    worker_id,
                 )
 
                 # Log completion time
