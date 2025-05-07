@@ -21,6 +21,8 @@ from copy import deepcopy
 from typing import Dict, List, Tuple, Optional, Any
 import concurrent.futures
 import zlib
+import tqdm
+import datetime
 
 
 # Import from passivbot
@@ -70,6 +72,55 @@ def dummy_task(x):
     for i in range(1000000):
         result += i
     return result
+
+
+class CachedEvaluator:
+    """Caches the evaluator to prevent repeated initialization"""
+
+    def __init__(
+        self,
+        shared_memory_files,
+        hlcvs_shapes,
+        hlcvs_dtypes,
+        btc_usd_shared_memory_files,
+        btc_usd_dtypes,
+        msss,
+        config,
+    ):
+        self.shared_memory_files = shared_memory_files
+        self.hlcvs_shapes = hlcvs_shapes
+        self.hlcvs_dtypes = hlcvs_dtypes
+        self.btc_usd_shared_memory_files = btc_usd_shared_memory_files
+        self.btc_usd_dtypes = btc_usd_dtypes
+        self.msss = msss
+        self.config = config
+        self.evaluator_cache = {}
+        self.seen_hashes = {}
+        self.duplicate_counter = {"count": 0}
+
+    def get_evaluator(self):
+        """Get or create an evaluator instance"""
+        from optimize import Evaluator
+        import multiprocessing
+
+        # Create a queue for this process
+        queue = multiprocessing.Queue()
+
+        # Create evaluator if not already cached
+        evaluator = Evaluator(
+            shared_memory_files=self.shared_memory_files,
+            hlcvs_shapes=self.hlcvs_shapes,
+            hlcvs_dtypes=self.hlcvs_dtypes,
+            btc_usd_shared_memory_files=self.btc_usd_shared_memory_files,
+            btc_usd_dtypes=self.btc_usd_dtypes,
+            msss=self.msss,
+            config=self.config,
+            results_queue=queue,
+            seen_hashes=self.seen_hashes,
+            duplicate_counter=self.duplicate_counter,
+        )
+
+        return evaluator, queue
 
 
 # Wrapper function for evaluating individuals in separate processes
@@ -1797,9 +1848,7 @@ class OptimizationClient(DistributedOptimizer):
         # Initialize GPU manager if using GPU
         if self.use_gpu:
             self.gpu_manager = GPUManager(
-                gpu_type=self.gpu_type,
                 gpu_id=self.gpu_id,
-                max_memory_percent=self.max_gpu_memory_percent,
             )
         else:
             self.gpu_manager = None
@@ -2154,51 +2203,81 @@ class OptimizationClient(DistributedOptimizer):
         """Reconnect to server after a disconnection with better error handling"""
         logging.info("Attempting to reconnect to server...")
 
-        try:
-            # Close existing sockets
-            self.dealer_socket.close()
-            self.sub_socket.close()
+        max_attempts = 5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # Close existing sockets
+                self.dealer_socket.close()
+                self.sub_socket.close()
 
-            # Create new sockets
-            self.dealer_socket = self.context.socket(zmq.DEALER)
-            self.sub_socket = self.context.socket(zmq.SUB)
+                # Wait a moment for sockets to close properly
+                await asyncio.sleep(1)
 
-            # Set client ID in socket
-            self.dealer_socket.setsockopt(zmq.IDENTITY, self.node_id.encode())
+                # Create new sockets
+                self.dealer_socket = self.context.socket(zmq.DEALER)
+                self.sub_socket = self.context.socket(zmq.SUB)
 
-            # Set socket options for more reliable connections
-            self.dealer_socket.setsockopt(
-                zmq.RECONNECT_IVL, 1000
-            )  # Reconnect after 1 second
-            self.dealer_socket.setsockopt(
-                zmq.RECONNECT_IVL_MAX, 10000
-            )  # Max 10 seconds between reconnects
-            self.dealer_socket.setsockopt(
-                zmq.LINGER, 0
-            )  # Don't wait for unsent messages when closing
+                # Set client ID in socket
+                self.dealer_socket.setsockopt(zmq.IDENTITY, self.node_id.encode())
 
-            # Connect to server
-            server_host, server_port = self.server_address.split(":")
-            self.dealer_socket.connect(f"tcp://{server_host}:{server_port}")
-            self.sub_socket.connect(f"tcp://{server_host}:{int(server_port)+1}")
-            self.sub_socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all messages
+                # Set socket options for more reliable connections
+                self.dealer_socket.setsockopt(
+                    zmq.RECONNECT_IVL, 1000
+                )  # Reconnect after 1 second
+                self.dealer_socket.setsockopt(
+                    zmq.RECONNECT_IVL_MAX, 10000
+                )  # Max 10 seconds between reconnects
+                self.dealer_socket.setsockopt(
+                    zmq.LINGER, 0
+                )  # Don't wait for unsent messages when closing
+                self.dealer_socket.setsockopt(
+                    zmq.TCP_KEEPALIVE, 1
+                )  # Enable TCP keepalive
+                self.dealer_socket.setsockopt(
+                    zmq.TCP_KEEPALIVE_IDLE, 60
+                )  # Seconds before sending keepalive probes
+                self.dealer_socket.setsockopt(
+                    zmq.TCP_KEEPALIVE_INTVL, 10
+                )  # Interval between keepalive probes
 
-            # Give ZMQ connections time to establish
-            await asyncio.sleep(2)
+                # Connect to server
+                server_host, server_port = self.server_address.split(":")
+                self.dealer_socket.connect(f"tcp://{server_host}:{server_port}")
+                self.sub_socket.connect(f"tcp://{server_host}:{int(server_port)+1}")
+                self.sub_socket.setsockopt(
+                    zmq.SUBSCRIBE, b""
+                )  # Subscribe to all messages
 
-            # Register with server
-            return await self.register_with_server()
+                # Give ZMQ connections time to establish
+                await asyncio.sleep(2)
 
-        except asyncio.CancelledError:
-            logging.warning("Reconnection attempt was cancelled")
-            return False
+                # Register with server
+                logging.info(f"Reconnection attempt {attempt}/{max_attempts}...")
+                success = await self.register_with_server()
 
-        except Exception as e:
-            logging.error(f"Error during reconnection: {e}")
-            import traceback
+                if success:
+                    logging.info("Successfully reconnected to server")
+                    return True
+                else:
+                    logging.warning(f"Reconnection attempt {attempt} failed")
 
-            traceback.print_exc()
-            return False
+                    # Exponential backoff
+                    await asyncio.sleep(min(30, 2**attempt))
+
+            except asyncio.CancelledError:
+                logging.warning("Reconnection attempt was cancelled")
+                return False
+            except Exception as e:
+                logging.error(f"Error during reconnection attempt {attempt}: {e}")
+                import traceback
+
+                traceback.print_exc()
+
+                # Exponential backoff
+                await asyncio.sleep(min(30, 2**attempt))
+
+        logging.error(f"Failed to reconnect after {max_attempts} attempts")
+        return False
 
     async def setup(self):
         """Connect to server and register"""
@@ -2495,7 +2574,7 @@ class OptimizationClient(DistributedOptimizer):
             logging.error(f"Failed to transfer data to NVIDIA GPU: {e}")
 
     def transfer_data_to_amd_gpu(self, exchange, hlcvs, btc_usd_data):
-        """Transfer data to AMD GPU using PyOpenCL"""
+        """Transfer data to AMD GPU using PyOpenCL with better error handling"""
         try:
             import pyopencl as cl
             import pyopencl.array
@@ -2503,6 +2582,34 @@ class OptimizationClient(DistributedOptimizer):
             # Get context and queue from GPU manager
             ctx = self.gpu_manager.context
             queue = self.gpu_manager.queue
+
+            # Check data sizes
+            hlcvs_size_mb = hlcvs.nbytes / (1024 * 1024)
+            btc_usd_size_mb = btc_usd_data.nbytes / (1024 * 1024)
+            total_size_mb = hlcvs_size_mb + btc_usd_size_mb
+
+            # Get available GPU memory
+            device_memory_mb = self.gpu_manager.memory_total / (1024 * 1024)
+
+            logging.info(f"Transferring {exchange} data to AMD GPU:")
+            logging.info(f"  HLCV data size: {hlcvs_size_mb:.2f} MB")
+            logging.info(f"  BTC/USD data size: {btc_usd_size_mb:.2f} MB")
+            logging.info(f"  Total data size: {total_size_mb:.2f} MB")
+            logging.info(f"  GPU memory: {device_memory_mb:.2f} MB")
+
+            # Check if data is too large (leave 20% buffer for other GPU operations)
+            max_allowed_mb = device_memory_mb * 0.8
+            if total_size_mb > max_allowed_mb:
+                logging.warning(
+                    f"Data size ({total_size_mb:.2f} MB) exceeds 80% of GPU memory ({max_allowed_mb:.2f} MB). "
+                    f"Skipping GPU transfer to avoid out-of-memory errors."
+                )
+                return False
+
+            # Check for zero-sized arrays
+            if hlcvs.size == 0 or btc_usd_data.size == 0:
+                logging.warning(f"Cannot transfer empty arrays to GPU. Skipping.")
+                return False
 
             # Transfer HLCV data to GPU
             logging.info(f"Transferring {exchange} HLCV data to AMD GPU...")
@@ -2522,17 +2629,44 @@ class OptimizationClient(DistributedOptimizer):
             self.gpu_data[exchange]["btc_usd"] = gpu_btc_usd
 
             logging.info(f"Successfully transferred {exchange} data to AMD GPU")
+            return True
 
+        except cl.LogicError as e:
+            if "INVALID_BUFFER_SIZE" in str(e):
+                logging.error(f"GPU buffer size error: {e}")
+                logging.error(
+                    f"HLCV shape: {hlcvs.shape}, dtype: {hlcvs.dtype}, size: {hlcvs.nbytes / (1024*1024):.2f} MB"
+                )
+                logging.error(
+                    f"BTC/USD shape: {btc_usd_data.shape}, dtype: {btc_usd_data.dtype}, size: {btc_usd_data.nbytes / (1024*1024):.2f} MB"
+                )
+                logging.error(
+                    "The data is too large for the GPU memory. Try using --hybrid-mode with a smaller --gpu-batch-size."
+                )
+                return False
+            else:
+                logging.error(f"OpenCL error: {e}")
+                return False
         except Exception as e:
             logging.error(f"Failed to transfer data to AMD GPU: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
 
     async def process_task(self, task):
-        """Process an optimization task with robust error handling"""
+        """Process an optimization task with robust error handling and progress display"""
         task_id = task["task_id"]
         individuals = task["individuals"]
         overrides_list = self.config.get("optimize", {}).get("enable_overrides", [])
 
-        logging.info(f"Processing task {task_id} with {len(individuals)} individuals")
+        # Show task information
+        start_time = time.time()
+        print(f"\n{'='*80}")
+        print(
+            f"Starting task {task_id} with {len(individuals)} individuals at {datetime.datetime.now().strftime('%H:%M:%S')}"
+        )
+        print(f"{'='*80}")
 
         # Determine processing mode based on available resources
         use_gpu = (
@@ -2544,23 +2678,26 @@ class OptimizationClient(DistributedOptimizer):
         )
 
         if use_gpu and self.hybrid_mode:
-            logging.info(f"Using hybrid CPU/GPU mode with {self.n_workers} CPU workers")
+            print(f"Using hybrid CPU/GPU mode with {self.n_workers} CPU workers")
         elif use_gpu:
-            logging.info(f"Using GPU mode")
+            print(f"Using GPU mode")
         else:
-            logging.info(f"Using CPU mode with {self.n_workers} workers")
+            print(f"Using CPU mode with {self.n_workers} workers")
 
         # Set up progress tracking
         total_individuals = len(individuals)
         processed = 0
         valid_results = 0
-        last_progress_update = time.time()
         results = []
 
         try:
+            # Keep connection alive during task processing
+            keep_alive_task = asyncio.create_task(self.keep_connection_alive(task_id))
+
             # Process individuals with resource management and worker limiting
             if use_gpu and not self.hybrid_mode:
                 # GPU-only processing
+                print("Processing with GPU...")
                 results = await self.process_individuals_gpu(
                     individuals, overrides_list, task_id
                 )
@@ -2571,8 +2708,13 @@ class OptimizationClient(DistributedOptimizer):
                 gpu_count = min(len(individuals), self.gpu_batch_size)
                 cpu_count = len(individuals) - gpu_count
 
+                print(
+                    f"Hybrid processing: {gpu_count} individuals on GPU, {cpu_count} on CPU"
+                )
+
                 # Process GPU batch
                 if gpu_count > 0:
+                    print("Starting GPU processing...")
                     gpu_individuals = individuals[:gpu_count]
                     gpu_results_task = asyncio.create_task(
                         self.process_individuals_gpu(
@@ -2582,6 +2724,7 @@ class OptimizationClient(DistributedOptimizer):
 
                 # Process CPU batch
                 if cpu_count > 0:
+                    print("Starting CPU processing...")
                     cpu_individuals = individuals[gpu_count:]
                     cpu_results_task = asyncio.create_task(
                         self.process_individuals_cpu(
@@ -2595,18 +2738,8 @@ class OptimizationClient(DistributedOptimizer):
                     results.extend(gpu_results)
                     valid_results += len(gpu_results)
                     processed += gpu_count
-
-                    # Send progress update
-                    await self.dealer_socket.send(
-                        json.dumps(
-                            {
-                                "type": "progress",
-                                "task_id": task_id,
-                                "processed": processed,
-                                "total": total_individuals,
-                                "valid_results": valid_results,
-                            }
-                        ).encode()
+                    print(
+                        f"\nGPU processing complete: {len(gpu_results)} valid results from {gpu_count} individuals"
                     )
 
                 if cpu_count > 0:
@@ -2614,21 +2747,70 @@ class OptimizationClient(DistributedOptimizer):
                     results.extend(cpu_results)
                     valid_results += len(cpu_results)
                     processed += cpu_count
+                    print(
+                        f"\nCPU processing complete: {len(cpu_results)} valid results from {cpu_count} individuals"
+                    )
             else:
                 # CPU-only processing
+                print("Processing with CPU...")
                 results = await self.process_individuals_cpu(
                     individuals, overrides_list, task_id
                 )
                 processed = len(individuals)
                 valid_results = len(results)
 
+            # Cancel keep-alive task
+            keep_alive_task.cancel()
+            try:
+                await keep_alive_task
+            except asyncio.CancelledError:
+                pass
+
+            # Calculate elapsed time
+            elapsed_time = time.time() - start_time
+            hours, remainder = divmod(elapsed_time, 3600)
+            minutes, seconds = divmod(remainder, 60)
+
+            # Calculate performance metrics
+            if valid_results > 0:
+                # Extract some key metrics for display
+                best_adg = 0
+                best_drawdown = 1.0
+                best_sharpe = 0
+
+                for result in results:
+                    if "analyses_combined" in result:
+                        metrics = result["analyses_combined"]
+                        adg = metrics.get("w_adg", 0)
+                        drawdown = metrics.get("w_drawdown_worst", 1.0)
+                        sharpe = metrics.get("w_sharpe_ratio", 0)
+
+                        best_adg = max(best_adg, adg)
+                        best_drawdown = min(best_drawdown, drawdown)
+                        best_sharpe = max(best_sharpe, sharpe)
+
+                # Display best metrics
+                print(f"Best metrics found:")
+                print(f"  ADG: {best_adg:.6f}")
+                print(f"  Drawdown: {best_drawdown:.6f}")
+                print(f"  Sharpe: {best_sharpe:.6f}")
+
             # Send final results
-            logging.info(
+            print(f"\n{'='*80}")
+            print(
                 f"Task {task_id} completed: {valid_results}/{total_individuals} valid results"
             )
+            print(
+                f"Time elapsed: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
+            )
+            print(
+                f"Processing speed: {total_individuals/elapsed_time:.2f} individuals/second"
+            )
+            print(f"{'='*80}")
 
             # Compress results if they're large
             if self.use_compression and len(results) > 10:
+                print("Compressing results for transmission...")
                 # Prepare message
                 result_message = {
                     "type": "result",
@@ -2647,6 +2829,7 @@ class OptimizationClient(DistributedOptimizer):
                 await self.dealer_socket.send(json.dumps(wrapper).encode())
             else:
                 # Send uncompressed results
+                print("Sending results to server...")
                 await self.dealer_socket.send(
                     json.dumps(
                         {"type": "result", "task_id": task_id, "results": results}
@@ -2655,6 +2838,7 @@ class OptimizationClient(DistributedOptimizer):
 
             # Signal ready for more tasks
             await self.dealer_socket.send(json.dumps({"type": "ready"}).encode())
+            print("Ready for next task")
 
         except Exception as e:
             logging.error(f"Error processing task {task_id}: {e}")
@@ -2676,13 +2860,58 @@ class OptimizationClient(DistributedOptimizer):
                 # If we can't send ready message, try to reconnect
                 await self.reconnect_to_server()
 
+    # Add a new method to keep the connection alive during long-running tasks
+    async def keep_connection_alive(self, task_id):
+        """Send periodic heartbeats during long-running tasks to prevent disconnection"""
+        interval = 30  # Send a heartbeat every 30 seconds
+
+        try:
+            while True:
+                # Send a heartbeat to keep the connection alive
+                try:
+                    resource_info = {
+                        "cpu_percent": psutil.cpu_percent(interval=None),
+                        "memory_percent": psutil.virtual_memory().percent,
+                        "workers": self.n_workers,
+                    }
+
+                    await self.dealer_socket.send(
+                        json.dumps(
+                            {
+                                "type": "heartbeat",
+                                "resources": resource_info,
+                                "task_id": task_id,
+                                "processing": True,
+                            }
+                        ).encode()
+                    )
+
+                    # Don't wait for response to avoid blocking
+                except Exception as e:
+                    logging.warning(f"Error sending keep-alive heartbeat: {e}")
+
+                    # Try to reconnect if we can't send heartbeats
+                    if isinstance(e, (zmq.ZMQError, ConnectionError)):
+                        logging.error(
+                            "Connection issue detected, attempting to reconnect"
+                        )
+                        await self.reconnect_to_server()
+
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            # This is expected when the task completes
+            pass
+        except Exception as e:
+            logging.error(f"Error in keep_connection_alive: {e}")
+
     async def process_individuals_cpu(self, individuals, overrides_list, task_id):
-        """Process individuals using CPU with better worker management"""
+        """Process individuals using CPU with better worker management and progress display"""
         results = []
         processed = 0
         valid_results = 0
         total = len(individuals)
         last_progress_update = time.time()
+        start_time = time.time()
 
         # Create tasks for each individual
         tasks = []
@@ -2695,32 +2924,96 @@ class OptimizationClient(DistributedOptimizer):
                 )
             )
 
-        # Wait for all individuals to be processed
-        for result in await asyncio.gather(*tasks):
-            if result:
-                results.append(result)
-                valid_results += 1
+        # Create a progress bar with ETA
+        with tqdm.tqdm(
+            total=total,
+            desc="Processing",
+            unit="ind",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+        ) as pbar:
+            # Process tasks as they complete
+            for future in asyncio.as_completed(tasks):
+                result = await future
 
-            processed += 1
+                if result:
+                    results.append(result)
+                    valid_results += 1
 
-            # Send progress updates periodically
-            current_time = time.time()
-            if current_time - last_progress_update > 10:  # Every 10 seconds
-                await self.dealer_socket.send(
-                    json.dumps(
-                        {
-                            "type": "progress",
-                            "task_id": task_id,
-                            "processed": processed,
-                            "total": total,
-                            "valid_results": valid_results,
-                        }
-                    ).encode()
-                )
-                last_progress_update = current_time
+                    # Extract some key metrics for display
+                    if "analyses_combined" in result:
+                        metrics = result["analyses_combined"]
+                        adg = metrics.get("w_adg", 0)
+                        drawdown = metrics.get("w_drawdown_worst", 0)
+                        sharpe = metrics.get("w_sharpe_ratio", 0)
 
-                # Also optimize memory if needed
-                self.optimize_memory_usage()
+                        # Update progress bar with metrics
+                        pbar.set_postfix(
+                            valid=valid_results,
+                            adg=f"{adg:.4f}",
+                            dd=f"{drawdown:.4f}",
+                            sharpe=f"{sharpe:.2f}",
+                        )
+                    else:
+                        pbar.set_postfix(valid=valid_results)
+
+                processed += 1
+                pbar.update(1)
+
+                # Send progress updates periodically
+                current_time = time.time()
+                if (
+                    current_time - last_progress_update > 5
+                ):  # Every 5 seconds (more frequent)
+                    # Calculate speed and ETA
+                    elapsed = current_time - start_time
+                    speed = processed / elapsed if elapsed > 0 else 0
+                    remaining = (total - processed) / speed if speed > 0 else 0
+
+                    # Format ETA
+                    eta_hours, remainder = divmod(remaining, 3600)
+                    eta_minutes, eta_seconds = divmod(remainder, 60)
+                    eta_str = f"{int(eta_hours):02d}:{int(eta_minutes):02d}:{int(eta_seconds):02d}"
+
+                    # Send progress to server
+                    await self.dealer_socket.send(
+                        json.dumps(
+                            {
+                                "type": "progress",
+                                "task_id": task_id,
+                                "processed": processed,
+                                "total": total,
+                                "valid_results": valid_results,
+                                "speed": speed,
+                                "eta": eta_str,
+                            }
+                        ).encode()
+                    )
+                    last_progress_update = current_time
+
+                    # Also optimize memory if needed
+                    self.optimize_memory_usage()
+
+                    # Send a heartbeat to keep connection alive during long-running tasks
+                    try:
+                        await self.dealer_socket.send(
+                            json.dumps({"type": "heartbeat"}).encode()
+                        )
+                    except Exception as e:
+                        logging.debug(f"Error sending heartbeat during processing: {e}")
+
+        # Final progress update
+        await self.dealer_socket.send(
+            json.dumps(
+                {
+                    "type": "progress",
+                    "task_id": task_id,
+                    "processed": processed,
+                    "total": total,
+                    "valid_results": valid_results,
+                    "complete": True,
+                }
+            ).encode()
+        )
 
         return results
 
@@ -3027,7 +3320,7 @@ class OptimizationClient(DistributedOptimizer):
     async def process_individual(
         self, individual, overrides_list, worker_semaphore, worker_id=0
     ):
-        """Process a single individual with resource management"""
+        """Process a single individual with resource management and cached evaluator"""
         try:
             # Check if we should pause due to high resource usage
             await self.resource_manager.wait_for_resources()
@@ -3040,27 +3333,73 @@ class OptimizationClient(DistributedOptimizer):
                 # Run the evaluation in a separate thread to avoid blocking the event loop
                 loop = asyncio.get_event_loop()
 
-                # Run in process pool with the module-level function
+                # Create a function that will run in the process pool
+                def process_with_cached_evaluator():
+                    # Try to optimize this process for CPU usage
+                    self.ensure_worker_cpu_intensive(worker_id)
+
+                    from optimize import individual_to_config, optimizer_overrides
+
+                    # Use the cached evaluator
+                    if not hasattr(self, "cached_evaluator"):
+                        # Log only once when creating the cached evaluator
+                        logging.info("Creating cached evaluator for better performance")
+                        self.cached_evaluator = CachedEvaluator(
+                            self.shared_memory_files,
+                            self.hlcvs_shapes,
+                            self.hlcvs_dtypes,
+                            self.btc_usd_shared_memory_files,
+                            self.btc_usd_dtypes,
+                            self.msss,
+                            self.config,
+                        )
+
+                    # Get evaluator and queue
+                    evaluator, queue = self.cached_evaluator.get_evaluator()
+
+                    # Evaluate the individual
+                    objectives = evaluator.evaluate(individual, overrides_list)
+
+                    # Get result from queue
+                    result = queue.get()
+
+                    # Add individual to result
+                    result["individual"] = individual
+
+                    # Ensure config is present
+                    if "config" not in result:
+                        result["config"] = individual_to_config(
+                            individual,
+                            optimizer_overrides,
+                            overrides_list,
+                            template=self.config,
+                        )
+
+                    return result
+
+                # Run in process pool
                 result = await loop.run_in_executor(
-                    self.process_pool,
-                    process_with_cpu_optimization,
-                    worker_id,
-                    individual,
-                    overrides_list,
-                    self.config,
-                    self.shared_memory_files,
-                    self.hlcvs_shapes,
-                    self.hlcvs_dtypes,
-                    self.btc_usd_shared_memory_files,
-                    self.btc_usd_dtypes,
-                    self.msss,
+                    self.process_pool, process_with_cached_evaluator
                 )
 
                 # Log completion time
                 end_time = time.time()
-                logging.info(
-                    f"Individual processed in {end_time - start_time:.2f} seconds."
-                )
+
+                # Only log every 10th individual to reduce log spam
+                if worker_id % 10 == 0:
+                    logging.info(
+                        f"Individual {worker_id} processed in {end_time - start_time:.2f} seconds."
+                    )
+
+                # Keep connection alive during long-running tasks
+                if end_time - start_time > 60:  # If processing took more than a minute
+                    try:
+                        # Send a quick heartbeat to keep connection alive
+                        await self.dealer_socket.send(
+                            json.dumps({"type": "heartbeat"}).encode()
+                        )
+                    except Exception as e:
+                        logging.debug(f"Error sending heartbeat during processing: {e}")
 
                 return result
 
@@ -3073,17 +3412,11 @@ class OptimizationClient(DistributedOptimizer):
 
     async def heartbeat_loop(self):
         """Send periodic heartbeats to server with improved error handling"""
-        heartbeat_interval = 15  # Send heartbeat every 15 seconds
+        heartbeat_interval = 10  # Send heartbeat every 10 seconds (more frequent)
         missed_heartbeats = 0
 
         while True:
             try:
-                # Skip heartbeat if we're currently processing a task
-                # This reduces unnecessary network traffic during intensive computation
-                if self.is_processing_task:
-                    await asyncio.sleep(heartbeat_interval)
-                    continue
-
                 # Get current resource usage
                 cpu_percent = psutil.cpu_percent(interval=0.5)
                 memory_percent = psutil.virtual_memory().percent
@@ -3111,7 +3444,7 @@ class OptimizationClient(DistributedOptimizer):
                 # Wait for acknowledgment with timeout
                 try:
                     response = await asyncio.wait_for(
-                        self.dealer_socket.recv(), timeout=10.0
+                        self.dealer_socket.recv(), timeout=5.0  # Shorter timeout
                     )
 
                     # Parse response
@@ -3179,8 +3512,10 @@ class OptimizationClient(DistributedOptimizer):
                         f"No heartbeat acknowledgment received (missed: {missed_heartbeats})"
                     )
 
-                    if missed_heartbeats >= 3:
-                        # Try to reconnect after 3 consecutive missed heartbeats
+                    if (
+                        missed_heartbeats >= 2
+                    ):  # Reduced from 3 to 2 for faster reconnection
+                        # Try to reconnect after 2 consecutive missed heartbeats
                         logging.error(
                             "Connection appears to be lost, attempting to reconnect"
                         )
@@ -3188,7 +3523,7 @@ class OptimizationClient(DistributedOptimizer):
                             missed_heartbeats = 0
                         else:
                             # If reconnection fails, wait before trying again
-                            await asyncio.sleep(10)
+                            await asyncio.sleep(5)  # Reduced wait time
                 except asyncio.CancelledError:
                     # This is expected during shutdown
                     logging.info("Heartbeat loop cancelled")
@@ -3204,14 +3539,14 @@ class OptimizationClient(DistributedOptimizer):
                 logging.error(f"Error in heartbeat loop: {e}")
                 missed_heartbeats += 1
 
-                if missed_heartbeats >= 3:
-                    # Try to reconnect after 3 consecutive errors
+                if missed_heartbeats >= 2:  # Reduced from 3 to 2
+                    # Try to reconnect after 2 consecutive errors
                     logging.error("Too many heartbeat errors, attempting to reconnect")
                     if await self.reconnect_to_server():
                         missed_heartbeats = 0
                     else:
                         # If reconnection fails, wait before trying again
-                        await asyncio.sleep(10)
+                        await asyncio.sleep(5)  # Reduced wait time
 
             # Wait for next heartbeat
             await asyncio.sleep(heartbeat_interval)
@@ -3319,8 +3654,12 @@ class OptimizationClient(DistributedOptimizer):
             traceback.print_exc()
             return False
 
+    # Modify the status_listener method in the OptimizationClient class
     async def status_listener(self):
-        """Listen for status broadcasts from server"""
+        """Listen for status broadcasts from server with reduced output frequency"""
+        last_status_time = 0
+        status_interval = 60  # Only show status every 60 seconds
+
         while True:
             try:
                 message = await self.sub_socket.recv()
@@ -3347,13 +3686,45 @@ class OptimizationClient(DistributedOptimizer):
                     logging.error(f"Error parsing status message: {e}")
                     continue
 
-                if status.get("type") == "status":
+                # Only log status messages at a reasonable interval
+                current_time = time.time()
+                if (
+                    status.get("type") == "status"
+                    and current_time - last_status_time >= status_interval
+                ):
+                    last_status_time = current_time
+
+                    # Format a more concise status message
+                    clients = status.get("clients", 0)
+                    pending = status.get("pending_tasks", 0)
+                    completed = status.get("completed_tasks", 0)
+                    pf_size = status.get("pareto_front_size", 0)
+                    iteration = status.get("iteration", 0)
+
+                    # More meaningful status message
                     logging.info(
-                        f"Server status: {status['clients']} clients, "
-                        f"{status['pending_tasks']} pending tasks, "
-                        f"{status['completed_tasks']} completed tasks, "
-                        f"PF size: {status['pareto_front_size']}"
+                        f"Server Status | Clients: {clients} | Tasks: {pending} pending, {completed} done | "
+                        f"Iterations: {iteration} | Pareto front: {pf_size} members"
                     )
+
+                # Handle task progress updates
+                elif status.get("type") == "task_progress":
+                    task_id = status.get("task_id", "unknown")
+                    processed = status.get("processed", 0)
+                    total = status.get("total", 0)
+                    valid = status.get("valid_results", 0)
+
+                    # Only show progress if this is our task
+                    if (
+                        self.current_task
+                        and self.current_task.get("task_id") == task_id
+                    ):
+                        # Clear the line and show progress
+                        print(
+                            f"\rTask progress: {processed}/{total} ({valid} valid) [{processed/total*100:.1f}%]",
+                            end="",
+                        )
+
             except Exception as e:
                 logging.error(f"Error in status listener: {e}")
 
