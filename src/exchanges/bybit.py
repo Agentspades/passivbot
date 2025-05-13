@@ -50,7 +50,9 @@ class BybitBot(Passivbot):
             elm = self.markets_dict[symbol]
             self.symbol_ids[symbol] = elm["id"]
             self.min_costs[symbol] = (
-                0.1 if elm["limits"]["cost"]["min"] is None else elm["limits"]["cost"]["min"]
+                0.1
+                if elm["limits"]["cost"]["min"] is None
+                else elm["limits"]["cost"]["min"]
             )
             self.min_qtys[symbol] = elm["limits"]["amount"]["min"]
             self.qty_steps[symbol] = elm["precision"]["amount"]
@@ -121,7 +123,8 @@ class BybitBot(Passivbot):
         limit = 200
         try:
             fetched_positions, fetched_balance = await asyncio.gather(
-                self.cca.fetch_positions(params={"limit": limit}), self.cca.fetch_balance()
+                self.cca.fetch_positions(params={"limit": limit}),
+                self.cca.fetch_balance(),
             )
             balinfo = fetched_balance["info"]["result"]["list"][0]
             if balinfo["accountType"] == "UNIFIED":
@@ -135,7 +138,12 @@ class BybitBot(Passivbot):
             else:
                 balance = fetched_balance[self.quote]["total"]
             while True:
-                if all([elm["symbol"] + elm["side"] in positions for elm in fetched_positions]):
+                if all(
+                    [
+                        elm["symbol"] + elm["side"] in positions
+                        for elm in fetched_positions
+                    ]
+                ):
                     break
                 next_page_cursor = None
                 for elm in fetched_positions:
@@ -181,7 +189,9 @@ class BybitBot(Passivbot):
         # intervals: 1,3,5,15,30,60,120,240,360,720,D,M,W
         fetched = None
         try:
-            fetched = await self.cca.fetch_ohlcv(symbol, timeframe=timeframe, limit=1000)
+            fetched = await self.cca.fetch_ohlcv(
+                symbol, timeframe=timeframe, limit=1000
+            )
             return fetched
         except Exception as e:
             logging.error(f"error fetching ohlcv for {symbol} {e}")
@@ -233,13 +243,17 @@ class BybitBot(Passivbot):
                 params["startTime"] = int(start_time)
             if end_time is not None:
                 params["endTime"] = int(end_time)
-            fetched = (await self.cca.private_get_v5_position_closed_pnl(params))["result"]
+            fetched = (await self.cca.private_get_v5_position_closed_pnl(params))[
+                "result"
+            ]
             while True:
                 fetched["list"] = sorted(
                     floatify(fetched["list"]), key=lambda x: float(x["updatedTime"])
                 )
                 for i in range(len(fetched["list"])):
-                    fetched["list"][i]["timestamp"] = float(fetched["list"][i]["updatedTime"])
+                    fetched["list"][i]["timestamp"] = float(
+                        fetched["list"][i]["updatedTime"]
+                    )
                     fetched["list"][i]["symbol"] = self.get_symbol_id_inv(
                         fetched["list"][i]["symbol"]
                     )
@@ -270,7 +284,9 @@ class BybitBot(Passivbot):
                     f"fetched pnls from {ts_to_date_utc(fetched['list'][-1]['updatedTime'])} n pnls: {len(fetched['list'])}"
                 )
                 params["cursor"] = fetched["nextPageCursor"]
-                fetched = (await self.cca.private_get_v5_position_closed_pnl(params))["result"]
+                fetched = (await self.cca.private_get_v5_position_closed_pnl(params))[
+                    "result"
+                ]
             return sorted(all_pnls, key=lambda x: x["updatedTime"])
         except Exception as e:
             logging.error(f"error fetching pnls {e}")
@@ -312,10 +328,15 @@ class BybitBot(Passivbot):
     async def fetch_pnls(self, start_time=None, end_time=None, limit=None):
         # fetch fills first, then pnls (bybit has them in separate endpoints)
         if start_time:
-            if self.get_exchange_time() - start_time < 1000 * 60 * 60 * 4 and limit == 100:
+            if (
+                self.get_exchange_time() - start_time < 1000 * 60 * 60 * 4
+                and limit == 100
+            ):
                 # set start time to None (fetch latest) if start time is recent
                 start_time = None
-        fills = await self.fetch_fills(start_time=start_time, end_time=end_time, limit=limit)
+        fills = await self.fetch_fills(
+            start_time=start_time, end_time=end_time, limit=limit
+        )
         if start_time:
             fills = [x for x in fills if x["timestamp"] >= start_time - 1000 * 60 * 60]
         if not fills:
@@ -377,7 +398,9 @@ class BybitBot(Passivbot):
             except Exception as e:
                 logging.error(f"debug filter cancellations {e}")
         return await self.execute_multiple(
-            orders, "execute_cancellation", self.config["live"]["max_n_cancellations_per_batch"]
+            orders,
+            "execute_cancellation",
+            self.config["live"]["max_n_cancellations_per_batch"],
         )
 
     async def execute_order(self, order: dict) -> dict:
@@ -390,7 +413,9 @@ class BybitBot(Passivbot):
             params={
                 "positionIdx": 1 if order["position_side"] == "long" else 2,
                 "timeInForce": (
-                    "postOnly" if self.config["live"]["time_in_force"] == "post_only" else "GTC"
+                    "postOnly"
+                    if self.config["live"]["time_in_force"] == "post_only"
+                    else "GTC"
                 ),
                 "orderLinkId": order["custom_id"],
             },
@@ -422,7 +447,9 @@ class BybitBot(Passivbot):
                 logging.error(f"{symbol}: error setting cross mode {e}")
             try:
                 coros_to_call_lev[symbol] = asyncio.create_task(
-                    self.cca.set_leverage(int(self.live_configs[symbol]["leverage"]), symbol=symbol)
+                    self.cca.set_leverage(
+                        int(self.live_configs[symbol]["leverage"]), symbol=symbol
+                    )
                 )
             except Exception as e:
                 logging.error(f"{symbol}: a error setting leverage {e}")
@@ -457,19 +484,103 @@ class BybitBot(Passivbot):
 
     async def fetch_ohlcvs_1m(self, symbol: str, since: float = None, limit=None):
         n_candles_limit = 1000 if limit is None else limit
-        if since is None:
-            result = await self.cca.fetch_ohlcv(symbol, timeframe="1m", limit=n_candles_limit)
-            return result
-        since = since // 60000 * 60000
-        max_n_fetches = 5000 // n_candles_limit
-        all_fetched = []
-        for i in range(max_n_fetches):
-            fetched = await self.cca.fetch_ohlcv(
-                symbol, timeframe="1m", since=int(since), limit=n_candles_limit
-            )
-            all_fetched += fetched
-            if len(fetched) < n_candles_limit:
-                break
-            since = fetched[-1][0]
-        all_fetched_d = {x[0]: x for x in all_fetched}
-        return sorted(all_fetched_d.values(), key=lambda x: x[0])
+        max_retries = 3
+        retry_delay = 2  # seconds
+
+        for attempt in range(max_retries):
+            try:
+                if since is None:
+                    result = await self.cca.fetch_ohlcv(
+                        symbol,
+                        timeframe="1m",
+                        limit=n_candles_limit,
+                        params={"timeout": 10000},  # 10 seconds timeout
+                    )
+                    return result
+
+                since = since // 60000 * 60000
+                max_n_fetches = 5000 // n_candles_limit
+                all_fetched = []
+
+                for i in range(max_n_fetches):
+                    fetched = await self.cca.fetch_ohlcv(
+                        symbol,
+                        timeframe="1m",
+                        since=int(since),
+                        limit=n_candles_limit,
+                        params={"timeout": 10000},  # 10 seconds timeout
+                    )
+                    all_fetched += fetched
+                    if len(fetched) < n_candles_limit:
+                        break
+                    since = fetched[-1][0]
+
+                    # Add a small delay between consecutive fetches to avoid rate limits
+                    if i < max_n_fetches - 1 and fetched:
+                        await asyncio.sleep(0.2)
+
+                all_fetched_d = {x[0]: x for x in all_fetched}
+                return sorted(all_fetched_d.values(), key=lambda x: x[0])
+
+            except (asyncio.TimeoutError, ccxt.base.errors.RequestTimeout) as e:
+                if attempt < max_retries - 1:
+                    logging.warning(
+                        f"Timeout fetching OHLCV for {symbol}, retry {attempt+1}/{max_retries} in {retry_delay}s"
+                    )
+                    await asyncio.sleep(retry_delay)
+                    # Increase delay for subsequent retries (exponential backoff)
+                    retry_delay *= 1.5
+                else:
+                    logging.error(
+                        f"Failed to fetch OHLCV for {symbol} after {max_retries} attempts: {e}"
+                    )
+                    # Return empty result or raise exception based on your preference
+                    if since is None:
+                        return []
+                    else:
+                        all_fetched_d = {}
+                        return []
+            except Exception as e:
+                logging.error(f"Error fetching OHLCV for {symbol}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 1.5
+                else:
+                    raise
+
+    async def fetch_ohlcvs_1m_with_retry(
+        self, symbol, limit=100, max_retries=3, retry_delay=5
+    ):
+        """
+        Fetch OHLCV data with automatic retries on timeout.
+
+        Args:
+            symbol: Trading pair symbol
+            limit: Number of candles to fetch
+            max_retries: Maximum number of retry attempts
+            retry_delay: Delay between retries in seconds
+
+        Returns:
+            List of OHLCV candles
+        """
+        for attempt in range(max_retries):
+            try:
+                # Use a longer timeout for the request
+                return await asyncio.wait_for(
+                    self.fetch_ohlcvs_1m(symbol, limit=limit),
+                    timeout=30,  # Increase timeout to 30 seconds
+                )
+            except (asyncio.TimeoutError, ccxt.base.errors.RequestTimeout) as e:
+                if attempt < max_retries - 1:
+                    print(
+                        f"Timeout fetching OHLCV for {symbol}, retrying in {retry_delay}s... ({attempt+1}/{max_retries})"
+                    )
+                    await asyncio.sleep(retry_delay)
+                else:
+                    print(
+                        f"Failed to fetch OHLCV for {symbol} after {max_retries} attempts"
+                    )
+                    raise
+            except Exception as e:
+                print(f"Error fetching OHLCV for {symbol}: {e}")
+                raise
