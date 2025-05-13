@@ -357,3 +357,5 @@ reports/*
 src/data.zip
 caches/
 data.zip
+src/passivbot-rust/Cargo.lock
+passivbot-rust/Cargo.lock
