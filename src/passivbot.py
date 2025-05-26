@@ -148,7 +148,7 @@ class Passivbot:
         self.ohlcvs_1m_rolling_window_days = config["live"]["ohlcvs_1m_rolling_window_days"]
         self.n_symbols_missing_ohlcvs_1m = 1000
         self.ohlcvs_1m_update_timestamps = {}
-        self.max_n_concurrent_ohlcvs_1m_updates = 3
+        self.max_n_concurrent_ohlcvs_1m_updates = 30
         self.stop_signal_received = False
         self.ohlcvs_1m_update_timestamps_WS = {}
         self.PB_mode_stop = {
