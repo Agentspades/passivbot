@@ -2258,7 +2258,7 @@ class Passivbot:
     async def update_ohlcvs_1m_single(self, symbol, max_age_ms=None):
         if max_age_ms is None:
             max_age_ms = self.ohlcvs_1m_max_age_ms
-        self.lock_timeout_ms = 5000.0
+        self.lock_timeout_ms = 30000.0
         try:
             if not (symbol in self.active_symbols or symbol in self.eligible_symbols):
                 return
