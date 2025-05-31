@@ -20,6 +20,8 @@ from uuid import uuid4
 from copy import deepcopy
 from collections import defaultdict
 from sortedcontainers import SortedDict
+import psutil
+import gc
 
 from procedures import (
     load_broker_code,
@@ -97,6 +99,26 @@ def or_default(f, *args, default=None, **kwargs):
         return f(*args, **kwargs)
     except:
         return default
+def log_memory_usage(self):
+    """Log current memory usage"""
+    try:
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        memory_mb = memory_info.rss / 1024 / 1024
+        
+        if memory_mb > 1000:  # Log if over 1GB
+            logging.warning(f"High memory usage: {memory_mb:.1f} MB")
+            
+            # Force garbage collection
+            gc.collect()
+            
+            # Log largest objects
+            if memory_mb > 1500:  # If over 1.5GB, do more aggressive cleanup
+                self.cleanup_caches()
+                self.trim_all_ohlcvs_1m()
+                
+    except Exception as e:
+        logging.error(f"Error checking memory usage: {e}")
 
 
 class Passivbot:
@@ -337,10 +359,37 @@ class Passivbot:
             for order in orders_sent:
                 self.whole_minute_cache["orders_sent"].add(self.order_to_order_tuple(order))
 
+    def trim_all_ohlcvs_1m(self):
+        """Trim OHLCV data for all symbols to prevent memory bloat"""
+        try:
+            for symbol in list(self.ohlcvs_1m.keys()):
+                self.trim_ohlcvs_1m(symbol)
+                # Remove empty entries
+                if symbol in self.ohlcvs_1m and not self.ohlcvs_1m[symbol]:
+                    del self.ohlcvs_1m[symbol]
+        except Exception as e:
+            logging.error(f"error trimming all ohlcvs_1m: {e}")
+
+
     async def run_execution_loop(self):
+        last_trim_ts = 0
+        last_memory_check = 0
+
         while not self.stop_signal_received:
             try:
                 now = utc_ms()
+
+               # Memory management every 5 minutes
+                if now - last_memory_check > 1000 * 60 * 5:
+                    self.log_memory_usage()
+                    last_memory_check = now
+                    
+                # Trim data every 10 minutes
+                if now - last_trim_ts > 1000 * 60 * 10:
+                    self.trim_all_ohlcvs_1m()
+                    self.cleanup_caches()
+                    last_trim_ts = now
+                    
                 if now - self.previous_REST_update_ts > 1000 * 60:
                     self.previous_REST_update_ts = utc_ms()
                     await self.prepare_for_execution()
@@ -569,6 +618,28 @@ class Passivbot:
                         f"failed to load config {self.flags[symbol].live_config_path} for {symbol} {e}. Using default config."
                     )
         self.set_wallet_exposure_limits()
+
+    def trim_ohlcvs_1m(self, symbol):
+        try:
+            if not hasattr(self, "ohlcvs_1m"):
+                return
+            if symbol not in self.ohlcvs_1m:
+                return
+            age_limit = (
+                self.get_exchange_time() - 1000 * 60 * 60 * 24 * self.ohlcvs_1m_rolling_window_days
+            )
+            for i in range(len(self.ohlcvs_1m[symbol])):
+                ts = self.ohlcvs_1m[symbol].peekitem(0)[0]
+                if ts < age_limit:
+                    del self.ohlcvs_1m[symbol][ts]
+                else:
+                    break
+            return True
+        except Exception as e:
+            logging.error(f"error with {get_function_name()} {symbol} {e}")
+            traceback.print_exc()
+            return False
+
 
     def pad_sym(self, symbol):
         return f"{symbol: <{self.sym_padding}}"
@@ -1216,6 +1287,18 @@ class Passivbot:
             except Exception as e:
                 logging.error(f"error dumping pnls to {self.pnls_cache_filepath} {e}")
         self.upd_timestamps["pnls"] = utc_ms()
+        self.pnls = sorted(
+            {
+                elm["id"]: elm for elm in self.pnls + new_pnls if elm["timestamp"] >= age_limit
+            }.values(),
+            key=lambda x: x["timestamp"],
+        )
+        
+        # Add this: Limit PNL entries to prevent memory bloat
+        max_pnl_entries = 10000  # Adjust based on your needs
+        if len(self.pnls) > max_pnl_entries:
+            self.pnls = self.pnls[-max_pnl_entries:]
+            logging.info(f"Trimmed PNL entries to {max_pnl_entries}")
         return True
 
     async def update_open_orders(self):
@@ -1838,16 +1921,42 @@ class Passivbot:
             if self.order_to_order_tuple(x[1]) not in already_sent
         ]
         return to_cancel, to_create
+    
+    def cleanup_caches(self):
+        """Clean up various caches to prevent memory bloat"""
+        try:
+            # Clean up ticker cache if it gets too large
+            if hasattr(self, 'tickers') and len(self.tickers) > 1000:
+                # Keep only active symbols
+                active_tickers = {k: v for k, v in self.tickers.items() if k in self.active_symbols}
+                self.tickers = active_tickers
+                
+            # Clean up formatted symbols map
+            if hasattr(self, 'formatted_symbols_map') and len(self.formatted_symbols_map) > 1000:
+                self.formatted_symbols_map = {}
+                self.formatted_symbols_map_inv = defaultdict(set)
+                
+            # Clean up coin to symbol map
+            if hasattr(self, 'coin_to_symbol_map') and len(self.coin_to_symbol_map) > 1000:
+                self.coin_to_symbol_map = {}
+                
+            logging.info("Cleaned up caches")
+        except Exception as e:
+            logging.error(f"Error cleaning caches: {e}")
+
 
     async def restart_bot_on_too_many_errors(self):
         if not hasattr(self, "error_counts"):
             self.error_counts = []
         now = utc_ms()
         self.error_counts = [x for x in self.error_counts if x > now - 1000 * 60 * 60] + [now]
-        max_n_errors_per_hour = 10
-        logging.info(
-            f"error count: {len(self.error_counts)} of {max_n_errors_per_hour} errors per hour"
-        )
+        max_error_entries = 100
+        if len(self.error_counts) > max_error_entries:
+            self.error_counts = self.error_counts[-max_error_entries:]
+            max_n_errors_per_hour = 10
+            logging.info(
+                f"error count: {len(self.error_counts)} of {max_n_errors_per_hour} errors per hour"
+            )
         if len(self.error_counts) >= max_n_errors_per_hour:
             await self.restart_bot()
             raise Exception("too many errors... restarting bot.")
