@@ -99,26 +99,7 @@ def or_default(f, *args, default=None, **kwargs):
         return f(*args, **kwargs)
     except:
         return default
-def log_memory_usage(self):
-    """Log current memory usage"""
-    try:
-        process = psutil.Process()
-        memory_info = process.memory_info()
-        memory_mb = memory_info.rss / 1024 / 1024
-        
-        if memory_mb > 1000:  # Log if over 1GB
-            logging.warning(f"High memory usage: {memory_mb:.1f} MB")
-            
-            # Force garbage collection
-            gc.collect()
-            
-            # Log largest objects
-            if memory_mb > 1500:  # If over 1.5GB, do more aggressive cleanup
-                self.cleanup_caches()
-                self.trim_all_ohlcvs_1m()
-                
-    except Exception as e:
-        logging.error(f"Error checking memory usage: {e}")
+
 
 
 class Passivbot:
@@ -289,6 +270,27 @@ class Passivbot:
                 elif not self.markets_dict[symbol]["active"]:
                     self.flagged_modes[pside][symbol] = "tp_only"
 
+    def log_memory_usage(self):
+        """Log current memory usage"""
+        try:
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            memory_mb = memory_info.rss / 1024 / 1024
+            
+            if memory_mb > 1000:  # Log if over 1GB
+                logging.warning(f"High memory usage: {memory_mb:.1f} MB")
+                
+                # Force garbage collection
+                gc.collect()
+                
+                # Log largest objects
+                if memory_mb > 1500:  # If over 1.5GB, do more aggressive cleanup
+                    self.cleanup_caches()
+                    self.trim_all_ohlcvs_1m()
+                    
+        except Exception as e:
+            logging.error(f"Error checking memory usage: {e}")
+
     async def update_first_timestamps(self, symbols=[]):
         if not hasattr(self, "first_timestamps"):
             self.first_timestamps = {}
@@ -389,7 +391,7 @@ class Passivbot:
                     self.trim_all_ohlcvs_1m()
                     self.cleanup_caches()
                     last_trim_ts = now
-                    
+
                 if now - self.previous_REST_update_ts > 1000 * 60:
                     self.previous_REST_update_ts = utc_ms()
                     await self.prepare_for_execution()
