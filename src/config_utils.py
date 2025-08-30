@@ -54,7 +54,9 @@ def expand_PB_mode(mode: str) -> str:
         raise Exception(f"unknown passivbot mode {mode}")
 
 
-def apply_allowed_modifications(src, modifications, allowed_overrides, return_full=True):
+def apply_allowed_modifications(
+    src, modifications, allowed_overrides, return_full=True
+):
     """
     Apply `modifications` to `src`, but only where `allowed_overrides` permits.
 
@@ -143,7 +145,9 @@ def apply_allowed_modifications(src, modifications, allowed_overrides, return_fu
                 return True
         return False
 
-    _apply_recursive(target, modifications, allowed_overrides, src if return_full else src)
+    _apply_recursive(
+        target, modifications, allowed_overrides, src if return_full else src
+    )
     return result
 
 
@@ -276,7 +280,11 @@ def set_nested_value_safe(d: dict, p: list, v: object, create_missing=False):
 def nested_update(base_dict, update_dict):
     """Recursively update base_dict with values from update_dict"""
     for key, value in update_dict.items():
-        if key in base_dict and isinstance(base_dict[key], dict) and isinstance(value, dict):
+        if (
+            key in base_dict
+            and isinstance(base_dict[key], dict)
+            and isinstance(value, dict)
+        ):
             nested_update(base_dict[key], value)
         else:
             base_dict[key] = value
@@ -297,7 +305,9 @@ def parse_overrides(config, verbose=True):
         coinf = symbol_to_coin(coin)
         if coinf != coin:
             if coinf:
-                result["coin_overrides"][coinf] = deepcopy(result["coin_overrides"][coin])
+                result["coin_overrides"][coinf] = deepcopy(
+                    result["coin_overrides"][coin]
+                )
                 if verbose:
                     print(f"Renamed {coin} -> {coinf} for coin_overrides")
             else:
@@ -325,7 +335,9 @@ def parse_overrides(config, verbose=True):
 
 def load_override_config(config, coin):
     try:
-        path = config.get("coin_overrides", {}).get(coin, {}).get("override_config_path")
+        path = (
+            config.get("coin_overrides", {}).get(coin, {}).get("override_config_path")
+        )
         if path and os.path.exists(path):
             return load_config(path, verbose=False)
         else:
@@ -360,7 +372,11 @@ def parse_old_coin_flags(config) -> dict:
         "WE_limit_short": ["bot", "short", "wallet_exposure_limit"],
         "leverage": ["live", "leverage"],
     }
-    if not isinstance(config, dict) or "live" not in config or "coin_flags" not in config["live"]:
+    if (
+        not isinstance(config, dict)
+        or "live" not in config
+        or "coin_flags" not in config["live"]
+    ):
         return {}
     flags = config["live"]["coin_flags"]
     if not isinstance(flags, dict):
@@ -381,7 +397,9 @@ def parse_old_coin_flags(config) -> dict:
             )
         for key, val in keysvals.items():
             if val and key in key_map:
-                set_nested_value_safe(result[coin], key_map[key], val, create_missing=True)
+                set_nested_value_safe(
+                    result[coin], key_map[key], val, create_missing=True
+                )
     return result
 
 
@@ -398,7 +416,9 @@ def _build_flag_argparser() -> argparse.ArgumentParser:
     return p
 
 
-def format_config(config: dict, verbose=True, live_only=False, base_config_path: str = "") -> dict:
+def format_config(
+    config: dict, verbose=True, live_only=False, base_config_path: str = ""
+) -> dict:
     # attempts to format a config to v7 config
     template = get_template_live_config("v7")
     # renamings
@@ -439,11 +459,16 @@ def format_config(config: dict, verbose=True, live_only=False, base_config_path:
         template["live"]["ignored_coins"] = sorted(set(config["ignored_symbols"]))
         for pside in ["long", "short"]:
             for key in template["bot"][pside]:
-                if key in cmap_inv and cmap_inv[key] in config["universal_live_config"][pside]:
-                    template["bot"][pside][key] = config["universal_live_config"][pside][
-                        cmap_inv[key]
-                    ]
-            close_grid_qty_pct = 1.0 / round(config["universal_live_config"][pside]["n_close_orders"])
+                if (
+                    key in cmap_inv
+                    and cmap_inv[key] in config["universal_live_config"][pside]
+                ):
+                    template["bot"][pside][key] = config["universal_live_config"][
+                        pside
+                    ][cmap_inv[key]]
+            close_grid_qty_pct = 1.0 / round(
+                config["universal_live_config"][pside]["n_close_orders"]
+            )
             template["bot"][pside]["close_grid_qty_pct"] = 1.0 / round(
                 config["universal_live_config"][pside]["n_close_orders"]
             )
@@ -465,7 +490,9 @@ def format_config(config: dict, verbose=True, live_only=False, base_config_path:
                 n_positions = config[f"n_{pside}s"]
             template["bot"][pside]["n_positions"] = n_positions
             template["bot"][pside]["unstuck_close_pct"] = config["unstuck_close_pct"]
-            template["bot"][pside]["unstuck_loss_allowance_pct"] = config["loss_allowance_pct"]
+            template["bot"][pside]["unstuck_loss_allowance_pct"] = config[
+                "loss_allowance_pct"
+            ]
             template["bot"][pside]["unstuck_threshold"] = config["stuck_threshold"]
             template["bot"][pside]["total_wallet_exposure_limit"] = (
                 config[f"TWE_{pside}"] if config[f"{pside}_enabled"] else 0.0
@@ -506,14 +533,16 @@ def format_config(config: dict, verbose=True, live_only=False, base_config_path:
             (
                 "filter_noisiness_rolling_window",
                 result["bot"][pside].get(
-                    "filter_rolling_window", result["live"].get("ohlcv_rolling_window", 60.0)
+                    "filter_rolling_window",
+                    result["live"].get("ohlcv_rolling_window", 60.0),
                 ),
                 [10.0, 1440.0],
             ),
             (
                 "filter_volume_rolling_window",
                 result["bot"][pside].get(
-                    "filter_rolling_window", result["live"].get("ohlcv_rolling_window", 60.0)
+                    "filter_rolling_window",
+                    result["live"].get("ohlcv_rolling_window", 60.0),
                 ),
                 [10.0, 1440.0],
             ),
@@ -526,7 +555,9 @@ def format_config(config: dict, verbose=True, live_only=False, base_config_path:
             (
                 "close_grid_markup_end",
                 result["bot"][pside].get("close_grid_min_markup", 0.001),
-                result["optimize"]["bounds"].get(f"{pside}_close_grid_min_markup", [0.001, 0.03]),
+                result["optimize"]["bounds"].get(
+                    f"{pside}_close_grid_min_markup", [0.001, 0.03]
+                ),
             ),
             (
                 "filter_volume_drop_pct",
@@ -542,7 +573,9 @@ def format_config(config: dict, verbose=True, live_only=False, base_config_path:
             if opt_key not in result["optimize"]["bounds"]:
                 result["optimize"]["bounds"][opt_key] = v_opt
                 if verbose:
-                    print(f"adding missing optimize parameter {pside} {opt_key}: {v_opt}")
+                    print(
+                        f"adding missing optimize parameter {pside} {opt_key}: {v_opt}"
+                    )
     result["bot"] = sort_dict_keys(result["bot"])
 
     for k0, src, dst in [
@@ -554,7 +587,9 @@ def format_config(config: dict, verbose=True, live_only=False, base_config_path:
             if verbose:
                 print(f"renaming parameter {k0} {src}: {dst}")
             del result[k0][src]
-    if "exchange" in result["backtest"] and isinstance(result["backtest"]["exchange"], str):
+    if "exchange" in result["backtest"] and isinstance(
+        result["backtest"]["exchange"], str
+    ):
         result["backtest"]["exchanges"] = [result["backtest"]["exchange"]]
         if verbose:
             print(
@@ -571,7 +606,9 @@ def format_config(config: dict, verbose=True, live_only=False, base_config_path:
     )
 
     for pside in result["bot"]:
-        result["bot"][pside]["n_positions"] = int(round(result["bot"][pside]["n_positions"]))
+        result["bot"][pside]["n_positions"] = int(
+            round(result["bot"][pside]["n_positions"])
+        )
 
     if not live_only:
         # unneeded adjustments if running live
@@ -658,10 +695,14 @@ def read_external_coins_lists(filepath) -> dict:
         if line.strip()
     ):
         # Split by newline, remove quotes and whitespace
-        items = [line.strip().strip("\"'") for line in content.split("\n") if line.strip()]
+        items = [
+            line.strip().strip("\"'") for line in content.split("\n") if line.strip()
+        ]
     else:
         # Split by newline, comma, and/or space, and filter out empty strings
-        items = [item.strip() for item in content.replace(",", " ").split() if item.strip()]
+        items = [
+            item.strip() for item in content.replace(",", " ").split() if item.strip()
+        ]
     return {"long": items, "short": items}
 
 
@@ -796,7 +837,9 @@ def add_missing_keys_recursively(src, dst, parent=None, verbose=True):
         else:
             if k not in dst:
                 if verbose:
-                    print(f"Adding missing key -> val {'.'.join(parent + [k])} -> {src[k]} to config")
+                    print(
+                        f"Adding missing key -> val {'.'.join(parent + [k])} -> {src[k]} to config"
+                    )
                 dst[k] = src[k]
 
 
@@ -804,7 +847,9 @@ def remove_unused_keys_recursively(src, dst, parent=[], verbose=True):
     for k in sorted(dst):
         if k in src:
             if isinstance(dst[k], dict):
-                remove_unused_keys_recursively(src[k], dst[k], parent + [k], verbose=verbose)
+                remove_unused_keys_recursively(
+                    src[k], dst[k], parent + [k], verbose=verbose
+                )
         else:
             del dst[k]
             if verbose:
@@ -916,7 +961,9 @@ def recursive_config_update(config, key, value, path=None):
     key_split = key.split(".")
     if key_split[0] in config:
         new_path = path + [key_split[0]]
-        return recursive_config_update(config[key_split[0]], ".".join(key_split[1:]), value, new_path)
+        return recursive_config_update(
+            config[key_split[0]], ".".join(key_split[1:]), value, new_path
+        )
 
     return False
 
@@ -1007,6 +1054,53 @@ def get_template_live_config(passivbot_mode="v7"):
             "approved_coins": [],
             "auto_gs": True,
             "empty_means_all_approved": False,
+            "enable_ai_agent": True,
+            "ai_agent": {
+                "enabled": True,
+                "dry_run": False,
+                "max_drawdown_pct": 0.12,
+                "max_daily_loss_pct": 0.06,
+                "max_trade_loss_pct": 0.03,
+                "min_interval_secs": 5,
+                "cooldown_secs_after_force_close": 120,
+                "cooldown_secs_after_adjust": 60,
+                "param_caps": {
+                    "long": {
+                        "grid_spacing_pct": {"min": 0.1, "max": 5.0},
+                        "pos_size_pct": {"min": 0.05, "max": 2.0},
+                    },
+                    "short": {
+                        "grid_spacing_pct": {"min": 0.1, "max": 5.0},
+                        "pos_size_pct": {"min": 0.05, "max": 2.0},
+                    },
+                },
+                # Backward-compat threshold; superseded by hysteresis.volatility_enter/exit
+                "volatility_threshold": 0.08,
+                "hysteresis": {
+                    "volatility_enter": 0.08,
+                    # if not provided in user config, exit defaults to 0.75*enter
+                    # kept here for template completeness
+                    "volatility_exit": 0.06,
+                    "dd_pause_enter": 0.12,
+                    # if not provided in user config, exit defaults to 0.8*enter
+                    # kept here for template completeness
+                    "dd_pause_exit": 0.10,
+                },
+                "smoothing": {
+                    "vol_ema_alpha": 0.2,
+                    "pnl_ema_alpha": 0.15,
+                },
+                "budgets": {
+                    "max_actions_per_hour": 12,
+                    "max_adjusts_per_hour": 8,
+                },
+                "shadow_mode": False,
+                "symbol_overrides": {},
+                "losing_streak_window": 5,
+                "losing_streak_adjustment": 0.2,
+                "audit_log_path": "logs/ai_agent_audit.jsonl",
+                "kill_switch": False,
+            },
             "execution_delay_seconds": 2.0,
             "filter_by_min_effective_cost": True,
             "forced_mode_long": "",
