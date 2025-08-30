@@ -10,6 +10,7 @@ import shutil
 import sys
 import traceback
 import zipfile
+import re
 from collections import deque
 from functools import wraps
 from io import BytesIO
@@ -31,19 +32,26 @@ from config_utils import (
     add_arguments_recursively,
     load_config,
     get_template_live_config,
+    update_config_with_args,
 )
 from pure_funcs import (
-    date_to_ts,
-    ts_to_date_utc,
     safe_filename,
+)
+from utils import (
+    make_get_filepath,
+    utc_ms,
+    format_end_date,
+    ts_to_date_utc,
+    date_to_ts,
+    get_file_mod_utc,
+    normalize_exchange_name,
+    get_quote,
     symbol_to_coin,
     coin_to_symbol,
+    load_markets,
+    format_approved_ignored_coins,
 )
 from procedures import (
-    make_get_filepath,
-    format_end_date,
-    utc_ms,
-    get_file_mod_utc,
     get_first_timestamps_unified,
 )
 
@@ -71,39 +79,6 @@ def is_valid_date(date):
 
 def get_function_name():
     return inspect.currentframe().f_back.f_code.co_name
-
-
-def normalize_exchange_name(exchange: str) -> str:
-    """
-    Normalize an exchange id to its USD-margined perpetual futures id when available.
-
-    Examples:
-    - "binance" -> "binanceusdm"
-    - "kucoin"  -> "kucoinfutures"
-    - "kraken"  -> "krakenfutures"
-
-    If no specific futures id exists (e.g. "okx", "bybit", "mexc"), the input is returned unchanged.
-    The function uses ccxt.exchanges to detect available ids, so it will automatically catch
-    new exchanges that follow common suffix patterns like 'usdm' or 'futures'.
-    """
-    ex = (exchange or "").lower()
-    valid = set(getattr(ccxt, "exchanges", []))
-
-    # Explicit mapping for known special case
-    if ex == "binance":
-        return "binanceusdm"
-
-    # If already a futures/perp id, keep as-is
-    if ex.endswith("usdm") or ex.endswith("futures"):
-        return ex
-
-    # Heuristic: prefer '{exchange}usdm' then '{exchange}futures' if available in ccxt
-    for suffix in ("usdm", "futures"):
-        cand = f"{ex}{suffix}"
-        if cand in valid:
-            return cand
-
-    return ex
 
 
 def dump_ohlcv_data(data, filepath):
@@ -331,57 +306,6 @@ def ensure_millis(df):
     return df
 
 
-async def load_markets(exchange: str, max_age_ms: int = 1000 * 60 * 60 * 24) -> dict:
-    """
-    Standalone helper to load and cache CCXT markets for a given exchange.
-
-    - Normalizes 'binance' -> 'binanceusdm'
-    - Reads from caches/{exchange}/markets.json if fresh
-    - Otherwise fetches via ccxt, writes cache, and returns the markets dict
-
-    Returns a markets dictionary as provided by ccxt.
-    """
-    ex = normalize_exchange_name(exchange)
-    markets_path = os.path.join("caches", ex, "markets.json")
-
-    # Try cache first
-    try:
-        if os.path.exists(markets_path):
-            if utc_ms() - get_file_mod_utc(markets_path) < max_age_ms:
-                markets = json.load(open(markets_path))
-                logging.info(f"{ex} Loaded markets from cache")
-                return markets
-    except Exception as e:
-        logging.error(f"Error loading {markets_path} {e}")
-
-    # Fetch from exchange via ccxt
-    cc = getattr(ccxt, ex)({"enableRateLimit": True})
-    try:
-        cc.options["defaultType"] = "swap"
-    except Exception:
-        pass
-
-    try:
-        markets = await cc.load_markets()
-    except Exception as e:
-        logging.error(f"Error loading markets from {ex}: {e}")
-        raise
-    finally:
-        try:
-            await cc.close()
-        except Exception:
-            pass
-
-    # Dump to cache
-    try:
-        json.dump(markets, open(make_get_filepath(markets_path), "w"))
-        logging.info(f"{ex} Dumped markets to cache")
-    except Exception as e:
-        logging.error(f"Error dumping markets to cache at {markets_path} {e}")
-
-    return markets
-
-
 class OHLCVManager:
     """
     Manages OHLCVs for multiple exchanges.
@@ -397,7 +321,7 @@ class OHLCVManager:
         verbose=True,
     ):
         self.exchange = normalize_exchange_name(exchange)
-        self.quote = "USDC" if exchange == "hyperliquid" else "USDT"
+        self.quote = get_quote(exchange)
         self.start_date = "2020-01-01" if start_date is None else format_end_date(start_date)
         self.end_date = format_end_date("now" if end_date is None else end_date)
         self.start_ts = date_to_ts(self.start_date)
@@ -435,11 +359,7 @@ class OHLCVManager:
 
     def get_symbol(self, coin):
         assert self.markets, "needs to call self.load_markets() first"
-        return coin_to_symbol(
-            coin,
-            {k for k in self.markets if self.markets[k]["swap"] and k.endswith(f":{self.quote}")},
-            self.quote,
-        )
+        return coin_to_symbol(coin, self.exchange)
 
     def get_market_specific_settings(self, coin):
         mss = self.markets[self.get_symbol(coin)]
@@ -462,6 +382,10 @@ class OHLCVManager:
             mss["taker"] = mss["taker_fee"] = 0.00055
         elif self.exchange == "bitget":
             pass
+        elif self.exchange in ("kucoin", "kucoinfutures"):
+            # ccxt reports incorrect fees for kucoin futures. Assume VIP0
+            mss["maker"] = mss["maker_fee"] = 0.0002
+            mss["taker"] = mss["taker_fee"] = 0.0006
         elif self.exchange == "gateio":
             # ccxt reports incorrect fees for gateio perps. Assume VIP0
             mss["maker"] = mss["maker_fee"] = 0.0002
@@ -550,6 +474,8 @@ class OHLCVManager:
             await self.download_ohlcvs_bybit(coin)
         elif self.exchange == "bitget":
             await self.download_ohlcvs_bitget(coin)
+        elif self.exchange in ("kucoin", "kucoinfutures"):
+            await self.download_ohlcvs_kucoin(coin)
         elif self.exchange == "gateio":
             if self.cc is None:
                 self.load_cc()
@@ -588,6 +514,9 @@ class OHLCVManager:
                 ohlcvs = await self.cc.fetch_ohlcv(
                     self.get_symbol(coin), since=int(date_to_ts("2020-01-01")), timeframe="1d"
                 )
+        elif self.exchange in ("kucoin", "kucoinfutures"):
+            fts = await self.find_first_day_kucoin(coin)
+            return fts
         elif self.exchange == "bitget":
             fts = await self.find_first_day_bitget(coin)
             return fts
@@ -605,7 +534,7 @@ class OHLCVManager:
 
     async def load_markets(self):
         self.load_cc()
-        self.markets = await load_markets(self.exchange)
+        self.markets = await load_markets(self.exchange, verbose=False)
         # Populate the ccxt client's markets without incurring another network call if possible
         try:
             if hasattr(self.cc, "set_markets"):
@@ -972,6 +901,134 @@ class OHLCVManager:
             self.dump_first_timestamp(coin, fts)
             return fts
         return None
+
+    async def download_ohlcvs_kucoin(self, coin: str):
+        # KuCoin has public data archives for futures
+        missing_days = await self.get_missing_days_ohlcvs(coin)
+        if not missing_days:
+            return
+        symbolf = self.get_symbol(coin).replace("/USDT:", "") + "M"
+        dirpath = make_get_filepath(os.path.join(self.cache_filepaths["ohlcvs"], coin, ""))
+        tasks = []
+        for day in sorted(missing_days):
+            fpath = os.path.join(dirpath, day + ".npy")
+            await self.check_rate_limit()
+            tasks.append(asyncio.create_task(self.download_single_kucoin(symbolf, day, fpath)))
+        for task in tasks:
+            try:
+                await task
+            except Exception as e:
+                logging.error(f"kucoin Error with downloader for {coin} {e}")
+
+    async def download_single_kucoin(self, symbolf: str, day: str, fpath: str):
+        url = f"https://historical-data.kucoin.com/data/futures/daily/klines/{symbolf}/1m/{symbolf}-1m-{day}.zip"
+        try:
+            zips = await fetch_zips(url)
+            if not zips:
+                if self.verbose:
+                    logging.info(f"kucoin No data at {url}")
+                return
+            dfs = []
+            for z in zips:
+                df = pd.read_csv(z)
+                df.columns = [c.strip().lower() for c in df.columns]
+                if "time" in df.columns:
+                    df = df.rename(columns={"time": "timestamp"})
+                required = ["timestamp", "open", "high", "low", "close", "volume"]
+                missing = [c for c in required if c not in df.columns]
+                if missing:
+                    raise Exception(f"kucoin missing columns {missing} in {url}")
+                dfs.append(df[required])
+            dfc = pd.concat(dfs, ignore_index=True)
+            # Cast and sort
+            for c in ["timestamp", "open", "high", "low", "close", "volume"]:
+                dfc[c] = pd.to_numeric(dfc[c], errors="coerce")
+            dfc = dfc.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+            # Normalize timestamp to ms
+            dfc = ensure_millis(dfc)
+            # Clip to day and fill minute gaps
+            start_ts_day = date_to_ts(day)
+            end_ts_day = start_ts_day + 24 * 60 * 60 * 1000
+            dfc = dfc[(dfc["timestamp"] >= start_ts_day) & (dfc["timestamp"] < end_ts_day)]
+            if dfc.empty:
+                if self.verbose:
+                    logging.info(f"kucoin Empty filtered dataframe for {symbolf} {day}")
+                return
+            # Deduplicate by timestamp
+            dfc = dfc.drop_duplicates(subset=["timestamp"], keep="last")
+            # Reindex to full 1m grid and fill
+            expected_ts = np.arange(start_ts_day, end_ts_day, 60000)
+            dfc = dfc.set_index("timestamp").reindex(expected_ts)
+            dfc["close"] = dfc["close"].ffill()
+            for col in ["open", "high", "low"]:
+                dfc[col] = dfc[col].fillna(dfc["close"])
+            dfc["volume"] = dfc["volume"].fillna(0.0)
+            dfc = dfc.reset_index().rename(columns={"index": "timestamp"})
+            if len(dfc) == 1440:
+                dump_ohlcv_data(ensure_millis(dfc), fpath)
+                if self.verbose:
+                    logging.info(f"kucoin Dumped daily data {fpath}")
+            else:
+                if self.verbose:
+                    logging.info(f"kucoin incomplete daily data for {symbolf} {day}: {len(dfc)} rows")
+        except Exception as e:
+            logging.error(f"kucoin Failed to download {url}: {e}")
+            traceback.print_exc()
+
+    async def find_first_day_kucoin(self, coin: str, start_year=2019) -> float:
+        """Find first day where data is available for a given symbol on KuCoin futures"""
+        if fts := self.load_first_timestamp(coin):
+            return fts
+        if not self.markets:
+            await self.load_markets()
+        symbolf = self.get_symbol(coin).replace("/USDT:", "") + "M"
+        base_url = "https://historical-data.kucoin.com/data/futures/daily/klines/"
+        start = datetime.datetime(start_year, 1, 1)
+        end = datetime.datetime.utcnow()
+        earliest = None
+
+        while start <= end:
+            mid = start + (end - start) // 2
+            day = mid.strftime("%Y-%m-%d")
+            url = f"{base_url}{symbolf}/1m/{symbolf}-1m-{day}.zip"
+            try:
+                await self.check_rate_limit()
+                async with aiohttp.ClientSession() as session:
+                    async with session.head(url) as response:
+                        if self.verbose:
+                            logging.info(
+                                f"kucoin, searching for first day of data for {symbolf} {day}"
+                            )
+                        if response.status == 200:
+                            earliest = mid
+                            end = mid - datetime.timedelta(days=1)
+                        else:
+                            start = mid + datetime.timedelta(days=1)
+            except Exception:
+                start = mid + datetime.timedelta(days=1)
+
+        if earliest:
+            prev_day = earliest - datetime.timedelta(days=1)
+            prev_day_str = prev_day.strftime("%Y-%m-%d")
+            prev_url = f"{base_url}{symbolf}/1m/{symbolf}-1m-{prev_day_str}.zip"
+            try:
+                await self.check_rate_limit()
+                async with aiohttp.ClientSession() as session:
+                    async with session.head(prev_url) as response:
+                        if response.status == 200:
+                            earliest = prev_day
+            except Exception:
+                pass
+            fts = date_to_ts(earliest.strftime("%Y-%m-%d"))
+            self.dump_first_timestamp(coin, fts)
+            if self.verbose:
+                logging.info(
+                    f"KuCoin, found first day for {symbolf}: {earliest.strftime('%Y-%m-%d')}"
+                )
+            return fts
+        fts = 0.0
+        self.dump_first_timestamp(coin, fts)
+        return fts
 
     async def download_ohlcvs_gateio(self, coin: str):
         # GateIO doesn't have public data archives, but has ohlcvs via REST API
@@ -1502,6 +1559,7 @@ async def fetch_data_for_coin_and_exchange(
         df = await om.get_ohlcvs(coin)
     except Exception as e:
         logging.warning(f"Error retrieving {coin} from {ex}: {e}")
+        traceback.print_exc()
         return None
 
     if df.empty:
@@ -1669,37 +1727,6 @@ async def compute_exchange_volume_ratios(
     return averages
 
 
-async def add_all_eligible_coins_to_config(config):
-    path = config["live"]["approved_coins"]
-    if config["live"]["empty_means_all_approved"] and path in [
-        [""],
-        [],
-        None,
-        "",
-        0,
-        0.0,
-        {"long": [], "short": []},
-        {"long": [""], "short": [""]},
-    ]:
-        approved_coins = await get_all_eligible_coins(config["backtest"]["exchanges"])
-        config["live"]["approved_coins"] = {"long": approved_coins, "short": approved_coins}
-
-
-async def get_all_eligible_coins(exchanges):
-    oms = {}
-    for ex in exchanges:
-        oms[ex] = OHLCVManager(ex, verbose=False)
-    await asyncio.gather(*[oms[ex].load_markets() for ex in oms])
-    approved_coins = set()
-    for ex in oms:
-        for s in oms[ex].markets:
-            if oms[ex].has_coin(s):
-                coin = symbol_to_coin(s)
-                if coin:
-                    approved_coins.add(symbol_to_coin(s))
-    return sorted(approved_coins)
-
-
 async def main():
     parser = argparse.ArgumentParser(prog="downloader", description="download ohlcv data")
     parser.add_argument(
@@ -1736,14 +1763,15 @@ async def main():
     else:
         logging.info(f"loading config {args.config_path}")
         config = load_config(args.config_path)
-    await add_all_eligible_coins_to_config(config)
+    update_config_with_args(config, args)
+    await format_approved_ignored_coins(config, config["backtest"]["exchanges"])
     oms = {}
     try:
         for ex in config["backtest"]["exchanges"]:
             oms[ex] = OHLCVManager(
                 ex, config["backtest"]["start_date"], config["backtest"]["end_date"]
             )
-        logging.info("loading markets for {config['backtest']['exchanges']}")
+        logging.info(f"loading markets for {config['backtest']['exchanges']}")
         await asyncio.gather(*[oms[ex].load_markets() for ex in oms])
         coins = [x for y in config["live"]["approved_coins"].values() for x in y]
         for coin in sorted(set(coins)):
